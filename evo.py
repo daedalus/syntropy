@@ -22,6 +22,7 @@ INITIAL_RESOURCES = 100
 RESOURCE_REGEN = 5
 RESOURCE_VALUE = 2.5
 REPRODUCTION_THRESHOLD = 5.0
+SEXUAL_THRESHOLD = 3.0
 ENERGY_COST_PER_CHILD = 2.5
 MUTATION_RATE = 0.12
 ENV_SHIFT_INTERVAL = (30, 60)
@@ -233,14 +234,33 @@ class World:
                 continue
 
             # --- REPRODUCTION ---
-            if org.energy >= REPRODUCTION_THRESHOLD:
+            if (
+                org.energy >= REPRODUCTION_THRESHOLD
+                or (org.energy >= SEXUAL_THRESHOLD
+                    and any(
+                        o is not org and o.id not in dead
+                        and o.energy >= SEXUAL_THRESHOLD
+                        and abs(o.x - org.x) <= 1 and abs(o.y - org.y) <= 1
+                        for o in self.organisms
+                    ))
+            ):
+                # Try to find a mate for sexual reproduction
+                mate = None
+                # Only seek mate if both have >= SEXUAL_THRESHOLD
+                if org.energy >= SEXUAL_THRESHOLD:
+                    for other in self.organisms:
+                        if other is org or other.id in dead:
+                            continue
+                        if other.energy >= SEXUAL_THRESHOLD:
+                            dx = abs(other.x - org.x)
+                            dy = abs(other.y - org.y)
+                            if dx <= 1 and dy <= 1:
+                                mate = other
+                                break
+
+                # Find adjacent empty cell
                 neighbors = []
-                for dx, dy in [
-                    (0, 1),
-                    (0, -1),
-                    (1, 0),
-                    (-1, 0),
-                ]:
+                for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
                     nx, ny = org.x + dx, org.y + dy
                     if 0 <= nx < WIDTH and 0 <= ny < HEIGHT:
                         if not any(
@@ -251,17 +271,37 @@ class World:
                             neighbors.append((nx, ny))
                 if neighbors:
                     nx, ny = random.choice(neighbors)
-                    child_genome = self._mutate(org.genome)
-                    self._spawn(
-                        nx, ny, child_genome, ENERGY_COST_PER_CHILD, org.generation + 1
-                    )
-                    org.energy -= ENERGY_COST_PER_CHILD * 1.1
-                    if org.generation + 1 > self.max_gen_ever:
-                        self.max_gen_ever = org.generation + 1
-                        self.events.append(
-                            f"⚡ Gen {self.max_gen_ever} reached! "
-                            f"({GLYPH_SET[child_genome[5] % len(GLYPH_SET)]})"
-                        )
+                    if mate:
+                        # SEXUAL: recombine genomes from both parents
+                        child_genome = []
+                        for i in range(len(GENES)):
+                            if random.random() < 0.5:
+                                child_genome.append(org.genome[i])
+                            else:
+                                child_genome.append(mate.genome[i])
+                        child_genome = self._mutate(child_genome)
+                        child_gen = max(org.generation, mate.generation) + 1
+                        energy_cost = ENERGY_COST_PER_CHILD * 0.7
+                        self._spawn(nx, ny, child_genome, energy_cost, child_gen)
+                        org.energy -= energy_cost
+                        mate.energy -= energy_cost
+                        if child_gen > self.max_gen_ever:
+                            self.max_gen_ever = child_gen
+                            self.events.append(
+                                f"⚡ Gen {self.max_gen_ever} (sexual! "
+                                f"{GLYPH_SET[child_genome[5] % len(GLYPH_SET)]})"
+                            )
+                    elif org.energy >= REPRODUCTION_THRESHOLD:
+                        # ASEXUAL: clone + mutate
+                        child_genome = self._mutate(org.genome)
+                        self._spawn(nx, ny, child_genome, ENERGY_COST_PER_CHILD, org.generation + 1)
+                        org.energy -= ENERGY_COST_PER_CHILD * 1.1
+                        if org.generation + 1 > self.max_gen_ever:
+                            self.max_gen_ever = org.generation + 1
+                            self.events.append(
+                                f"⚡ Gen {self.max_gen_ever} reached! "
+                                f"({GLYPH_SET[child_genome[5] % len(GLYPH_SET)]})"
+                            )
 
         # Remove dead
         pop_before = len(self.organisms)
