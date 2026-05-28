@@ -116,6 +116,7 @@ class Organism:
     generation: int
     id: int
     fat: float = 0.0
+    torpor: bool = False
 
 
 class World:
@@ -143,6 +144,7 @@ class World:
         self.season = "summer"
         self.season_timer = random.randint(*SEASON_LENGTH)
         self.diseased: Set[int] = set()
+        self.sonify_counter = 0
 
         for _ in range(INITIAL_RESOURCES):
             rtype = random.choices(RESOURCE_KEYS, weights=[t["weight"] for t in RESOURCE_TYPES.values()])[0]
@@ -203,6 +205,45 @@ class World:
             threading.Thread(
                 target=World._play_tone, args=(freq, dur, SOUND_VOLUME), daemon=True
             ).start()
+
+    @staticmethod
+    def _play_stereo(l_freq: float, r_freq: float, duration: float, volume: float = 0.3):
+        sr = 22050
+        n = int(sr * duration)
+        data = bytearray()
+        for i in range(n):
+            t = i / sr
+            env = 1.0 - i / n if duration > 0.05 else 1.0
+            ls = int(volume * env * 32767 * math.sin(2 * math.pi * l_freq * t))
+            rs = int(volume * env * 32767 * math.sin(2 * math.pi * r_freq * t))
+            data.extend(struct.pack("<h", ls))
+            data.extend(struct.pack("<h", rs))
+        try:
+            proc = subprocess.Popen(
+                ["aplay", "-q", "-f", "S16_LE", "-r", str(sr), "-c", "2"],
+                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            proc.communicate(input=bytes(data), timeout=1)
+        except Exception:
+            pass
+
+    def _sonify_tick(self):
+        if not SOUND_ENABLED:
+            return
+        n = len(self.organisms)
+        cap = WIDTH * HEIGHT
+        pop_density = n / cap if cap else 0
+        l_freq = 80 + pop_density * 720
+        if n > 0:
+            avg_gen = sum(o.generation for o in self.organisms) / n
+            gen_ratio = avg_gen / max(1, self.max_gen_ever)
+        else:
+            gen_ratio = 0.0
+        r_freq = 80 + gen_ratio * 720
+        threading.Thread(
+            target=World._play_stereo, args=(l_freq, r_freq, 0.04, SOUND_VOLUME * 0.5),
+            daemon=True
+        ).start()
 
     def _log_extinction(self, etype: str, pop: int):
         orgs = self.organisms
@@ -338,6 +379,18 @@ class World:
 
         dead: Set[int] = set()
 
+        # --- CARRYING CAPACITY (logistic soft ceiling on reproduction) ---
+        carry_cap = WIDTH * HEIGHT * 0.4
+        n_carry = len(self.organisms)
+        carry_pressure = 1.0 + (n_carry / carry_cap) ** 2
+
+        # --- CORPSE DECOMPOSITION (corpses feed adjacent organisms) ---
+        for (cx, cy), rtype in list(self.resources.items()):
+            if rtype == "corpse":
+                for org in self.organisms:
+                    if org.id not in dead and abs(org.x - cx) + abs(org.y - cy) <= 1:
+                        org.energy += 0.03
+
         random.shuffle(self.organisms)
 
         for org in self.organisms:
@@ -352,6 +405,19 @@ class World:
             if org.age < 3:
                 org.energy -= 0.05
             is_elder = org.age > 30
+
+            # --- TORPOR (hibernation during scarcity) ---
+            if org.torpor:
+                if org.energy >= 3.0:
+                    org.torpor = False
+                    torpid = False
+                else:
+                    torpid = True
+            elif org.energy <= 0.5:
+                org.torpor = True
+                torpid = True
+            else:
+                torpid = False
 
             # --- SENSE & MOVE ---
             speed = org.genome[0] + 1
@@ -396,7 +462,7 @@ class World:
                     target = (max(0, min(WIDTH-1, fx)), max(0, min(HEIGHT-1, fy)))
                     org.energy -= 0.05
 
-            if target:
+            if not torpid and target:
                 tx, ty = target
                 steps = min(speed, abs(tx - org.x) + abs(ty - org.y))
                 for _ in range(steps):
@@ -409,7 +475,7 @@ class World:
                     org.y = max(0, min(HEIGHT - 1, org.y + (dy if dy else 0)))
                     if (org.x, org.y) in self.resources:
                         break
-            else:
+            elif not torpid:
                 for _ in range(speed):
                     org.x = max(
                         0,
@@ -428,7 +494,7 @@ class World:
 
             # --- CONSUME RESOURCE ---
             pos = (org.x, org.y)
-            if pos in self.resources:
+            if not torpid and pos in self.resources:
                 rtype = self.resources.pop(pos)
                 base_val = RESOURCE_TYPES[rtype]["value"]
                 met_bonus = 1.0 + org.genome[3] * 0.2
@@ -441,6 +507,7 @@ class World:
             # --- METABOLIC COST ---
             base_cost = SUMMER_BASE_COST if self.season == "summer" else WINTER_BASE_COST
             base_cost += org.genome[3] * 0.15
+            size_cost = (org.genome[0] + org.genome[2]) * 0.01
             speed_cost = org.genome[0] * 0.02
             sense_cost = org.genome[1] * 0.025
             agg_cost = org.genome[2] * 0.015
@@ -450,35 +517,37 @@ class World:
             pref_temp = org.genome[7] / 4.0
             actual_temp = self._temperature_at(org.y)
             thermal_cost = abs(actual_temp - pref_temp) * 0.25
-            org.energy -= base_cost + speed_cost + sense_cost + agg_cost + thermal_cost + tox_cost
+            mult = 0.1 if torpid else 1.0
+            org.energy -= (base_cost + size_cost + speed_cost + sense_cost + agg_cost + thermal_cost + tox_cost) * mult
 
             # --- FIGHT (overlapping organisms) ---
-            for other in self.organisms:
-                if other is org or other.id in dead:
-                    continue
-                if other.x == org.x and other.y == org.y:
-                    a = org.genome[2]
-                    b = other.genome[2]
-                    if a > 0 and b > 0:
-                        org_power = max(0, org.energy) * (a + 1) / 4
-                        other_power = max(0, other.energy) * (b + 1) / 4
-                        total = org_power + other_power
-                        if total > 0 and random.random() < org_power / total:
-                            org.energy += other.energy * 0.25
+            if not torpid:
+                for other in self.organisms:
+                    if other is org or other.id in dead:
+                        continue
+                    if other.x == org.x and other.y == org.y:
+                        a = org.genome[2]
+                        b = other.genome[2]
+                        if a > 0 and b > 0:
+                            org_power = max(0, org.energy) * (a + 1) / 4
+                            other_power = max(0, other.energy) * (b + 1) / 4
+                            total = org_power + other_power
+                            if total > 0 and random.random() < org_power / total:
+                                org.energy += other.energy * 0.25
+                                dead.add(other.id)
+                            else:
+                                other.energy += org.energy * 0.25
+                                dead.add(org.id)
+                                break
+                        elif a > 0 and random.random() < a / 3:
+                            org.energy += other.energy * 0.2
                             dead.add(other.id)
-                        else:
-                            other.energy += org.energy * 0.25
-                            dead.add(org.id)
-                            break
-                    elif a > 0 and random.random() < a / 3:
-                        org.energy += other.energy * 0.2
-                        dead.add(other.id)
 
             if org.id in dead:
                 continue
 
             # --- HUNTING (carnivores actively attack adjacent organisms) ---
-            if diet >= 1:
+            if not torpid and diet >= 1:
                 for other in self.organisms:
                     if other is org or other.id in dead:
                         continue
@@ -530,6 +599,16 @@ class World:
             if org.id in dead:
                 continue
 
+            # --- SYMBIOSIS (herbivore + carnivore mutualism) ---
+            if not torpid and diet < 2:
+                for sym_other in self.organisms:
+                    if sym_other is org or sym_other.id in dead:
+                        continue
+                    if (diet == 0 and sym_other.genome[8] == 1) or (diet == 1 and sym_other.genome[8] == 0):
+                        if abs(sym_other.x - org.x) <= 1 and abs(sym_other.y - org.y) <= 1:
+                            org.energy += 0.03
+                            break
+
             # --- DISEASE ---
             if org.id in self.diseased:
                 # Spread BEFORE drain so patient zero infects others before dying
@@ -580,8 +659,8 @@ class World:
             density_penalty = 1.0 + max(0, local_density - 3) * 0.15
 
             # --- REPRODUCTION ---
-            repro_thresh = REPRODUCTION_THRESHOLD * density_penalty
-            sex_thresh = SEXUAL_THRESHOLD * density_penalty
+            repro_thresh = REPRODUCTION_THRESHOLD * density_penalty * carry_pressure
+            sex_thresh = SEXUAL_THRESHOLD * density_penalty * carry_pressure
             if is_elder:
                 repro_thresh *= 0.8
                 sex_thresh *= 0.8
@@ -705,6 +784,11 @@ class World:
         self.pop_history.append(pop_after)
         if len(self.pop_history) > 60:
             self.pop_history = self.pop_history[-60:]
+
+        # Sonify tick state
+        self.sonify_counter += 1
+        if self.sonify_counter % 3 == 0:
+            self._sonify_tick()
 
         # Population crash event
         if died > 5 and pop_after > 0:
@@ -872,6 +956,8 @@ class World:
                     grid[org.y][org.x] = f"{BOLD}\033[47m\033[30m{glyph}{RESET}"
                 elif org.id in self.diseased:
                     grid[org.y][org.x] = f"{BOLD}\033[41m{color}{glyph}{RESET}"
+                elif org.torpor:
+                    grid[org.y][org.x] = f"{DIM}\033[44m{color}{glyph}{RESET}"
                 elif org.fat > 1.5:
                     grid[org.y][org.x] = f"{BOLD}\033[43m{color}{glyph}{RESET}"
                 elif org.genome[9] > 0:
