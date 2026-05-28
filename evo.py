@@ -504,6 +504,7 @@ class Organism:
     age: int
     generation: int
     id: int
+    weight: float = 1.0
     genome_a: List[int] = field(default_factory=list)
     genome_b: List[int] = field(default_factory=list)
     active_bank: int = 0
@@ -811,21 +812,27 @@ class World:
         senses[Sensor.SIGNAL] = min(1.0, sig / 10.0)
         return senses
 
-    def apply_action(self, org: Organism, action_id: int, _arg: int):
+    def apply_action(self, org: Organism, action_id: int, _arg: int, speed: int = 1):
         dissipation = 1.0 + max(0, org.energy - 5.0) * 0.15
+        move_cost = 0.02 * dissipation * speed * org.weight
+        weight_burn = 0.01 * speed
 
         if action_id == Action.MOVE_N:
             org.y = _wy(org.y - 1)
-            org.energy -= 0.02 * dissipation
+            org.energy -= move_cost
+            org.weight = max(0.0, org.weight - weight_burn)
         elif action_id == Action.MOVE_S:
             org.y = _wy(org.y + 1)
-            org.energy -= 0.02 * dissipation
+            org.energy -= move_cost
+            org.weight = max(0.0, org.weight - weight_burn)
         elif action_id == Action.MOVE_E:
             org.x = _wx(org.x + 1)
-            org.energy -= 0.02 * dissipation
+            org.energy -= move_cost
+            org.weight = max(0.0, org.weight - weight_burn)
         elif action_id == Action.MOVE_W:
             org.x = _wx(org.x - 1)
-            org.energy -= 0.02 * dissipation
+            org.energy -= move_cost
+            org.weight = max(0.0, org.weight - weight_burn)
 
         elif action_id == Action.MOVE_TOWARD_FOOD:
             best = None
@@ -842,7 +849,8 @@ class World:
                 org.x = _wx(org.x + dx)
                 org.y = _wy(org.y + dy)
                 if dx or dy:
-                    org.energy -= 0.02 * dissipation
+                    org.energy -= move_cost
+                    org.weight = max(0.0, org.weight - weight_burn)
 
         elif action_id == Action.MOVE_AWAY_ORG:
             for other in self.organisms:
@@ -854,7 +862,8 @@ class World:
                     fy = org.y + (org.y - other.y)
                     org.x = _wx(fx)
                     org.y = _wy(fy)
-                    org.energy -= 0.02 * dissipation
+                    org.energy -= move_cost
+                    org.weight = max(0.0, org.weight - weight_burn)
                     break
 
         elif action_id == Action.EAT:
@@ -863,28 +872,31 @@ class World:
                 rtype = self.resources.pop(pos)
                 val = RESOURCE_TYPES[rtype]["value"]
                 org.energy += val
+                org.weight += val * 0.3
             else:
                 for other in self.organisms:
                     if other is org or other.energy <= 0:
                         continue
-                    if other.x == org.x and other.y == org.y and other.energy < org.energy * 0.6:
-                        gain = other.energy * 0.4
-                        org.energy += gain
-                        other.energy -= gain
-                        if other.energy <= 0:
-                            other.cause_of_death = "predation"
+                    if (other.x == org.x and other.y == org.y
+                            and other.energy < org.energy * 0.6
+                            and org.weight > other.weight):
+                        org.energy += other.energy * 0.4
+                        org.weight += other.weight * 0.6
+                        other.cause_of_death = "predation"
+                        other.energy = 0
                         break
 
         elif action_id == Action.ATTACK:
             for other in self.organisms:
                 if other is org:
                     continue
-                if other.x == org.x and other.y == org.y:
+                if other.x == org.x and other.y == org.y and org.weight > other.weight:
                     power = max(0.1, org.energy) * 0.3
                     other.energy -= power
                     if other.energy <= 0:
                         other.cause_of_death = "predation"
                         org.energy += other.energy * 0.5
+                        org.weight += other.weight * 0.5
                     break
 
         elif action_id == Action.REPRODUCE:
@@ -1096,7 +1108,7 @@ class World:
                                          Action.MOVE_W, Action.MOVE_TOWARD_FOOD, Action.MOVE_AWAY_ORG)
                     if is_move and MAX_MOVEMENT_SPEED > 0 and moved_n >= MAX_MOVEMENT_SPEED:
                         continue
-                    self.apply_action(org, act_id, arg)
+                    self.apply_action(org, act_id, arg, speed=moved_n + 1)
                     if is_move:
                         moved_n += 1
 
@@ -1133,6 +1145,8 @@ class World:
                     dy = (org.genome[min(1, len(org.genome)-1)] % 3) - 1 if len(org.genome) > 1 else 0
                     org.x = _wx(org.x + dx)
                     org.y = _wy(org.y + dy)
+                    if dx or dy:
+                        org.weight = max(0.0, org.weight - 0.005 * org.weight)
 
             # Nest building
             if not torpid and not asleep and org.energy > 3.0:
@@ -1197,7 +1211,9 @@ class World:
                 if pos in self.resources:
                     rtype = self.resources.pop(pos)
                     age_bonus = min(org.age, 20) / 20.0 * 0.2
-                    org.energy += RESOURCE_TYPES[rtype]["value"] * (0.3 + age_bonus)
+                    val = RESOURCE_TYPES[rtype]["value"]
+                    org.energy += val * (0.3 + age_bonus)
+                    org.weight += val * 0.1
 
             # Metabolic cost
             base_cost = SUMMER_BASE_COST if self.season == "summer" else WINTER_BASE_COST
@@ -1205,6 +1221,15 @@ class World:
             if asleep:
                 mult = 0.0
             org.energy -= (base_cost + 0.02) * mult
+            if not asleep:
+                org.weight = max(0.0, org.weight - 0.002 * mult)
+
+            # Starvation or weight loss
+            if org.energy <= 0 or org.weight <= 0:
+                cause = "disease" if org.id in self.diseased else "starvation" if org.energy <= 0 else "wasting"
+                org.cause_of_death = cause
+                dead.add(org.id)
+                continue
 
             # HGT: horizontal genome transfer
             if not torpid and random.random() < 0.02:
@@ -1535,7 +1560,8 @@ class World:
                     gc[k] = gc.get(k, 0) + 1
                 shannon = -sum((c/n) * math.log(c/n) for c in gc.values())
             lines.append(
-                f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  Age:{avg_age:.1f}  "
+                f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  W:{sum(o.weight for o in self.organisms)/n:.2f}  "
+                f"Gen:{max_g:3d}  Age:{avg_age:.1f}  "
                 f"Sp:{sp:2d}  H\u2019:{shannon:.2f}  Fos:{self.fossil_count:4d}  "
                 f"Res:{len(self.resources):3d}  "
                 f"{'☀ sum' if self.season == 'summer' else '\u2744 win'}  "
@@ -1608,7 +1634,8 @@ class World:
                 prog = " ".join(decoded[:18])
                 lines.append(
                     f"  sentinel: gen={sentinel.generation} age={sentinel.age} "
-                    f"⚡={sentinel.energy:.1f} len={len(sentinel.genome)} "
+                    f"⚡={sentinel.energy:.1f} wt={sentinel.weight:.2f} "
+                    f"len={len(sentinel.genome)} "
                     f"bank={'B' if sentinel.active_bank else 'A'}"
                 )
                 lines.append(f"  └vm: {prog}")
@@ -1722,7 +1749,7 @@ async def main():
                     decoded.append(f"{OP_NAMES[op]}({a1},{a2})")
                 prog = " ".join(decoded[:18])
                 print(f"  Best VM: gen={best.generation} age={best.age:.0f} "
-                      f"⚡={best.energy:.1f} len={len(best.genome)} "
+                      f"⚡={best.energy:.1f} wt={best.weight:.2f} len={len(best.genome)} "
                       f"bank={'B' if best.active_bank else 'A'} ({len(best.genome_b)}b)")
                 print(f"  └vm: {prog}")
                 if len(decoded) > 18:
