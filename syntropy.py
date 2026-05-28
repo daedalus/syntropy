@@ -1685,7 +1685,7 @@ class World:
                             "SENSE","ACT","PUSH","POP","CALL","RET","HALT","RAND","ENERGY",
                             "MOD","CMP","AND","OR","XOR","NOT","IND","MIN","MAX","ABS","NEG","DUP","JNE",
                             "SWAP","GEN","PICK","DPTH","PC","SETPC","SQRT","EXP","TICK","DROP","OVER",
-                            "SHL","SHR","BIT","MLOD","MSTR","GLOD","GSTR"]
+                            "SHL","SHR","BIT","MLOAD","MSTORE","GLOAD","GSTORE"]
                 g = sentinel.genome
                 decoded = []
                 for i in range(0, min(len(g), 54), 3):
@@ -1801,7 +1801,7 @@ async def main():
                             "SENSE","ACT","PUSH","POP","CALL","RET","HALT","RAND","ENERGY",
                             "MOD","CMP","AND","OR","XOR","NOT","IND","MIN","MAX","ABS","NEG","DUP","JNE",
                             "SWAP","GEN","PICK","DPTH","PC","SETPC","SQRT","EXP","TICK","DROP","OVER",
-                            "SHL","SHR","BIT","MLOD","MSTR","GLOD","GSTR"]
+                            "SHL","SHR","BIT","MLOAD","MSTORE","GLOAD","GSTORE"]
                 g = best.genome
                 decoded = []
                 for i in range(0, min(len(g), 54), 3):
