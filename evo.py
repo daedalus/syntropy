@@ -242,9 +242,10 @@ class World:
                     a = org.genome[2]
                     b = other.genome[2]
                     if a > 0 and b > 0:
-                        org_power = org.energy * (a + 1) / 4
-                        other_power = other.energy * (b + 1) / 4
-                        if random.random() < org_power / (org_power + other_power):
+                        org_power = max(0, org.energy) * (a + 1) / 4
+                        other_power = max(0, other.energy) * (b + 1) / 4
+                        total = org_power + other_power
+                        if total > 0 and random.random() < org_power / total:
                             org.energy += other.energy * 0.25
                             dead.add(other.id)
                         else:
