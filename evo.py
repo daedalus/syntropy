@@ -864,22 +864,31 @@ class World:
         self._dead_this_tick: Set[int] = set()
 
         # Run all organism VMs concurrently
-        async def _run_org(org) -> Tuple[Organism, List[Tuple[int, int]]]:
+        async def _run_org(org) -> Tuple[Organism, List[Tuple[int, int]], Dict[int, float]]:
             senses = self.compute_senses(org)
             budget = min(org.energy * 0.4, 8.0)
             actions = org.vm.execute(budget, senses)
-            return (org, actions)
+            return (org, actions, senses)
 
         results = await asyncio.gather(*[_run_org(o) for o in self.organisms])
 
         # Apply actions and organism-level systems
         dead: Set[int] = set()
 
-        for org, actions in results:
+        for org, actions, senses in results:
             if org.id in dead:
                 continue
 
             org.age += 1
+
+            # Environmental sensitivity — extreme heat/cold/pressure drain energy
+            temp = senses.get(Sensor.TEMP, 0.5)
+            press = senses.get(Sensor.PRESSURE, 0.5)
+            temp_stress = abs(temp - 0.5) * 2.0
+            press_stress = abs(press - 0.5) * 2.0
+            env_drain = (temp_stress * 0.04 + press_stress * 0.02)
+            if env_drain > 0:
+                org.energy -= env_drain
 
             # Life stage
             if org.age < 3:
@@ -1030,6 +1039,11 @@ class World:
                         i = random.randrange(min(len(org.genome), len(other.genome)))
                         org.vm.genome[i], other.vm.genome[i] = other.vm.genome[i], org.vm.genome[i]
                         break
+
+            # Random spontaneous mutation
+            if random.random() < 0.004:
+                i = random.randrange(len(org.genome))
+                org.vm.genome[i] = max(0, min(255, org.vm.genome[i] + random.choice([-1, 1])))
 
             # Disease
             if org.id in self.diseased:
