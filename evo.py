@@ -678,16 +678,14 @@ class World:
         return senses
 
     def apply_action(self, org: Organism, action_id: int, _arg: int):
-        speed = 1 + (org.vm.instr_count // 10)
-
         if action_id == Action.MOVE_N:
-            org.y = _wy(org.y - speed)
+            org.y = _wy(org.y - 1)
         elif action_id == Action.MOVE_S:
-            org.y = _wy(org.y + speed)
+            org.y = _wy(org.y + 1)
         elif action_id == Action.MOVE_E:
-            org.x = _wx(org.x + speed)
+            org.x = _wx(org.x + 1)
         elif action_id == Action.MOVE_W:
-            org.x = _wx(org.x - speed)
+            org.x = _wx(org.x - 1)
 
         elif action_id == Action.MOVE_TOWARD_FOOD:
             best = None
@@ -699,11 +697,10 @@ class World:
                     best = (fx, fy)
             if best:
                 fx, fy = best
-                for _ in range(min(speed, best_d)):
-                    dx = 1 if fx > org.x else -1 if fx < org.x else 0
-                    dy = 1 if fy > org.y else -1 if fy < org.y else 0
-                    org.x = _wx(org.x + dx)
-                    org.y = _wy(org.y + dy)
+                dx = 1 if fx > org.x else -1 if fx < org.x else 0
+                dy = 1 if fy > org.y else -1 if fy < org.y else 0
+                org.x = _wx(org.x + dx)
+                org.y = _wy(org.y + dy)
 
         elif action_id == Action.MOVE_AWAY_ORG:
             for other in self.organisms:
@@ -949,7 +946,6 @@ class World:
 
             # Genome-determined drift when VM produces no movement actions
             if not torpid and not asleep:
-                speed = 1 + (org.vm.instr_count // 10)
                 moved = any(
                     a[0] in (Action.MOVE_N, Action.MOVE_S, Action.MOVE_E,
                              Action.MOVE_W, Action.MOVE_TOWARD_FOOD, Action.MOVE_AWAY_ORG)
@@ -958,9 +954,8 @@ class World:
                 if not moved:
                     dx = (org.genome[0] % 3) - 1 if org.genome else 0
                     dy = (org.genome[min(1, len(org.genome)-1)] % 3) - 1 if len(org.genome) > 1 else 0
-                    for _ in range(speed):
-                        org.x = _wx(org.x + dx)
-                        org.y = _wy(org.y + dy)
+                    org.x = _wx(org.x + dx)
+                    org.y = _wy(org.y + dy)
 
             # Nest building
             if not torpid and not asleep and org.energy > 3.0:
