@@ -1365,7 +1365,7 @@ class World:
                 f"Sp:{sp:2d}  H\u2019:{shannon:.2f}  Fos:{self.fossil_count:4d}  "
                 f"Res:{len(self.resources):3d}  "
                 f"{'☀ sum' if self.season == 'summer' else '\u2744 win'}  "
-                f"T:{self.tick}  tot:{sum(o.energy+o.fat for o in self.organisms):.0f}/{MAX_SYSTEM_ENERGY}"
+                f"T:{self.tick}  tot:{sum(o.energy+o.fat for o in self.organisms):.0f}/{MAX_SYSTEM_ENERGY:.0f}"
             )
 
             # Day-night bar (fit within typical terminal width)
@@ -1447,7 +1447,7 @@ class World:
 
 
 async def main():
-    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT
+    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY
     parser = argparse.ArgumentParser(description="VM-genome evolutionary ecosystem")
     parser.add_argument("--volume", type=float, default=SOUND_VOLUME)
     parser.add_argument("--no-sound", action="store_true")
@@ -1456,6 +1456,7 @@ async def main():
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--width", type=int, default=WIDTH)
     parser.add_argument("--height", type=int, default=HEIGHT)
+    parser.add_argument("--max-energy", type=float, default=None)
     parser.add_argument("--continuous", action="store_true")
     args = parser.parse_args()
     if args.no_sound:
@@ -1466,6 +1467,8 @@ async def main():
     SEED = args.seed
     WIDTH = max(16, min(256, args.width))
     HEIGHT = max(8, min(64, args.height))
+    if args.max_energy is not None:
+        MAX_SYSTEM_ENERGY = max(10, args.max_energy)
     continuous = args.continuous
 
     run_count = 0
