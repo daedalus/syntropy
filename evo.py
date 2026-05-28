@@ -206,10 +206,16 @@ class World:
             pos = (org.x, org.y)
             if pos in self.resources:
                 rtype = self.resources.pop(pos)
-                org.energy += RESOURCE_TYPES[rtype]["value"]
+                base_val = RESOURCE_TYPES[rtype]["value"]
+                met_bonus = 1.0 + org.genome[3] * 0.2
+                org.energy += base_val * met_bonus
 
             # --- METABOLIC COST ---
-            org.energy -= 0.08 + org.genome[3] * 0.12
+            base_cost = 0.05 + org.genome[3] * 0.15
+            speed_cost = org.genome[0] * 0.02
+            sense_cost = org.genome[1] * 0.025
+            agg_cost = org.genome[2] * 0.015
+            org.energy -= base_cost + speed_cost + sense_cost + agg_cost
 
             # --- FIGHT (overlapping organisms) ---
             for other in self.organisms:
