@@ -62,7 +62,9 @@ class Op:
     MIN, MAX = 26, 27
     ABS, NEG = 28, 29
     DUP, JNE = 30, 31
-    TOTAL = 32
+    SWAP, GEN = 32, 33
+    PICK, DEPTH = 34, 35
+    TOTAL = 36
 
 # Per-opcode instruction cost (budget consumed per execution)
 OP_COST = [
@@ -83,6 +85,8 @@ OP_COST = [
     0.010, 0.010,  # MIN, MAX
     0.006, 0.006,  # ABS, NEG
     0.008, 0.012,  # DUP, JNE
+    0.008, 0.010,  # SWAP, GEN
+    0.008, 0.006,  # PICK, DEPTH
 ]
 
 class Sensor:
@@ -276,6 +280,20 @@ class GenomeVM:
             elif op == Op.JNE:
                 if abs(rv) >= 0.001:
                     self.pc = (a2 % max(3, glen)) // 3 * 3
+            elif op == Op.SWAP:
+                r2 = a2 % NUM_REGS
+                self.regs[ridx], self.regs[r2] = self.regs[r2], self.regs[ridx]
+            elif op == Op.GEN:
+                idx = a1 % max(1, len(self.genome))
+                self._sr(a2 % NUM_REGS, float(self.genome[idx]))
+            elif op == Op.PICK:
+                if self.stack:
+                    d = a1 % len(self.stack)
+                    self._sr(a2 % NUM_REGS, float(self.stack[-d - 1]))
+                else:
+                    self._sr(a2 % NUM_REGS, 0.0)
+            elif op == Op.DEPTH:
+                self._sr(a2 % NUM_REGS, float(len(self.stack)))
 
         return actions
 
@@ -1491,7 +1509,8 @@ class World:
             if sentinel and sentinel.generation > 0:
                 OP_NAMES = ["NOP","MOV","ADD","SUB","MUL","DIV","JMP","JZ","JG","JL",
                             "SENSE","ACT","PUSH","POP","CALL","RET","HALT","RAND","ENERGY",
-                            "MOD","CMP","AND","OR","XOR","NOT","IND","MIN","MAX","ABS","NEG","DUP","JNE"]
+                            "MOD","CMP","AND","OR","XOR","NOT","IND","MIN","MAX","ABS","NEG","DUP","JNE",
+                            "SWAP","GEN","PICK","DPTH"]
                 g = sentinel.genome
                 decoded = []
                 for i in range(0, min(len(g), 54), 3):
