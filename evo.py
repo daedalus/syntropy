@@ -7,6 +7,7 @@ reproducing with mutation, and adapting as niches open and collapse.
 No stable equilibrium. Ever-evolving.
 """
 
+import argparse
 import random
 import time
 import struct
@@ -136,18 +137,20 @@ class World:
             )
 
     SOUND_TONES = {
-        "mass_death": (200, 0.15),
-        "critical":   (100, 0.25),
-        "bottleneck": (150, 0.20),
-        "radiation":  (500, 0.10),
-        "disease":    (320, 0.12),
-        "epidemic":   (250, 0.20),
-        "migration":  (600, 0.10),
-        "fossil":     (700, 0.08),
-        "season":     (400, 0.10),
-        "recovery":   (750, 0.10),
-        "env_shift":  (280, 0.15),
-        "stress":     (180, 0.20),
+        "mass_death":   (200, 0.15),
+        "critical":     (100, 0.25),
+        "bottleneck":   (150, 0.20),
+        "radiation":    (500, 0.10),
+        "disease":      (320, 0.12),
+        "epidemic":     (250, 0.20),
+        "migration":    (600, 0.10),
+        "fossil":       (700, 0.08),
+        "season":       (400, 0.10),
+        "recovery":     (750, 0.10),
+        "env_shift":    (280, 0.15),
+        "stress":       (180, 0.20),
+        "new_gen":      (880, 0.06),
+        "gene_extinct": (130, 0.12),
     }
 
     @staticmethod
@@ -600,6 +603,7 @@ class World:
                                 f"⚡ Gen {self.max_gen_ever} (sexual! "
                                 f"{GLYPH_SET[child_genome[5] % len(GLYPH_SET)]})"
                             )
+                            self._sound("new_gen")
                     elif org.energy >= REPRODUCTION_THRESHOLD:
                         # ASEXUAL: clone + mutate
                         child_genome = self._mutate(org.genome, MUT_RATES[org.genome[6]])
@@ -611,6 +615,7 @@ class World:
                                 f"⚡ Gen {self.max_gen_ever} reached! "
                                 f"({GLYPH_SET[child_genome[5] % len(GLYPH_SET)]})"
                             )
+                            self._sound("new_gen")
 
         # Remove dead — but leave corpse resources
         pop_before = len(self.organisms)
@@ -655,6 +660,7 @@ class World:
                     f"🧬 Extinct: {GENES[gene_idx][0]}={v} "
                     f"(never again)"
                 )
+                self._sound("gene_extinct")
 
         # Record history
         self.pop_history.append(pop_after)
@@ -961,6 +967,23 @@ class World:
 
 
 def main():
+    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, EXTINCTION_LOG_FILE
+    parser = argparse.ArgumentParser(description="Evolutionary ecosystem simulator")
+    parser.add_argument("--volume", type=float, default=SOUND_VOLUME,
+                        help=f"sound volume 0-1 (default: {SOUND_VOLUME})")
+    parser.add_argument("--no-sound", action="store_true",
+                        help="disable all sounds")
+    parser.add_argument("--tick-rate", type=float, default=TICK_RATE,
+                        help=f"seconds per tick (default: {TICK_RATE})")
+    parser.add_argument("--log", default=EXTINCTION_LOG_FILE,
+                        help=f"extinction log file (default: {EXTINCTION_LOG_FILE})")
+    args = parser.parse_args()
+    if args.no_sound:
+        SOUND_ENABLED = False
+    SOUND_VOLUME = max(0.0, min(1.0, args.volume))
+    TICK_RATE = max(0.01, args.tick_rate)
+    EXTINCTION_LOG_FILE = args.log
+
     world = World()
     print("\033c", end="")
     interrupted = False
