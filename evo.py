@@ -1578,7 +1578,7 @@ class World:
 
 
 async def main():
-    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY
+    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY, MAX_MOVEMENT_SPEED
     parser = argparse.ArgumentParser(description="VM-genome evolutionary ecosystem")
     parser.add_argument("--volume", type=float, default=SOUND_VOLUME)
     parser.add_argument("--no-sound", action="store_true")
