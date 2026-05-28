@@ -108,6 +108,9 @@ class World:
         self.genes_lost: List[str] = []
         self.migration_timer = random.randint(*MIGRATION_INTERVAL)
         self.fossil_lineages: List[Tuple[int, ...]] = []
+        self.all_genomes_seen: Set[Tuple[int, ...]] = set()
+        self.recorded_fossils: Set[Tuple[int, ...]] = set()
+        self.fossil_count = 0
         self.season = "summer"
         self.season_timer = random.randint(*SEASON_LENGTH)
         self.diseased: Set[int] = set()
@@ -150,6 +153,7 @@ class World:
                 id=self.next_id,
             )
         )
+        self.all_genomes_seen.add(tuple(genome))
         self.next_id += 1
 
     def _temperature_at(self, y: int) -> float:
@@ -252,6 +256,24 @@ class World:
             else:
                 target = self._nearest_resource(org)
 
+            # --- FEAR RESPONSE: herbivores flee from nearby predators ---
+            if diet == 0 and org.genome[1] > 0:
+                sense = org.genome[1]
+                nearest_pred = None
+                min_d = sense + 1
+                for other in self.organisms:
+                    if other is org or other.id in dead or other.genome[8] < 1:
+                        continue
+                    d = abs(other.x - org.x) + abs(other.y - org.y)
+                    if d < min_d:
+                        min_d = d
+                        nearest_pred = other
+                if nearest_pred and random.random() < 0.6:
+                    fx = org.x + (org.x - nearest_pred.x)
+                    fy = org.y + (org.y - nearest_pred.y)
+                    target = (max(0, min(WIDTH-1, fx)), max(0, min(HEIGHT-1, fy)))
+                    org.energy -= 0.05
+
             if target:
                 tx, ty = target
                 steps = min(speed, abs(tx - org.x) + abs(ty - org.y))
@@ -341,9 +363,21 @@ class World:
                     if abs(other.x - org.x) <= 1 and abs(other.y - org.y) <= 1:
                         a = org.genome[2]
                         b = other.genome[2]
-                        atk_mult = 1.5 if diet == 1 else 1.0
+                        # Pack hunting: nearby predators coordinate
+                        pack_count = 0
+                        for packmate in self.organisms:
+                            if packmate is org or packmate.id in dead or packmate.genome[8] < 1:
+                                continue
+                            if abs(packmate.x - other.x) <= 2 and abs(packmate.y - other.y) <= 2:
+                                pack_count += 1
+                        pack_bonus = 1.0 + pack_count * 0.15
+                        atk_mult = (1.5 if diet == 1 else 1.0) * pack_bonus
+                        # Prey camouflage: hue matching temperature zone defends
+                        prey_hue = other.genome[5]
+                        prey_y_zone = int(5 * (1.0 - other.y / (HEIGHT - 1)))
+                        camo = 1.0 - abs(prey_hue - prey_y_zone) / 5.0
                         org_power = max(0.1, org.energy) * (a + 1) / 4 * atk_mult
-                        other_power = max(0.1, other.energy) * (b + 1) / 4
+                        other_power = max(0.1, other.energy) * (b + 1) / 4 * (1.0 + camo * 0.5)
                         total = org_power + other_power
                         if random.random() < org_power / total:
                             gain = other.energy * 0.6
@@ -577,6 +611,19 @@ class World:
             )
             self.migration_timer = random.randint(*MIGRATION_INTERVAL)
 
+        # --- FOSSIL RECORD: track extinct lineages ---
+        current_genomes = {tuple(o.genome) for o in self.organisms}
+        newly_extinct = self.all_genomes_seen - current_genomes - self.recorded_fossils
+        if newly_extinct:
+            for g in newly_extinct:
+                self.recorded_fossils.add(g)
+                self.fossil_lineages.append(g)
+            self.fossil_count += len(newly_extinct)
+            self.events.append(
+                f"🦴 {len(newly_extinct)} lineage(s) fossilized "
+                f"(total: {self.fossil_count})"
+            )
+
         # --- REGENERATE RESOURCES ---
         regen = SUMMER_REGEN if self.season == "summer" else WINTER_REGEN
         for _ in range(regen):
@@ -703,7 +750,7 @@ class World:
 
         lines.append(
             f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  "
-            f"Sp:{species:2d}  Spd:{avg_spd:.1f}  "
+            f"Sp:{species:2d}  Fos:{self.fossil_count:4d}  Spd:{avg_spd:.1f}  "
             f"Agg:{avg_agg:.1f}  Met:{avg_met:.1f}  "
             f"μMut:{avg_mut:.1f}  Tm:{avg_tmp:.1f}  D:{avg_diet:.1f}  Tx:{avg_tox:.1f}  "
             f"Res:{len(self.resources):3d}  Inf:{len(self.diseased):2d}  "
@@ -809,7 +856,8 @@ def main():
           f"Max age: {world.max_age_ever}  "
           f"Min pop: {world.min_pop_ever}")
     print(f"  Species now: {len({tuple(o.genome) for o in world.organisms})}  "
-          f"Infected: {len(world.diseased)}")
+          f"Infected: {len(world.diseased)}  "
+          f"Fossil lineages: {world.fossil_count}")
     if total_extinct:
         print(f"  Gene values lost to extinction: {total_extinct}")
     if world.extinction_log:
