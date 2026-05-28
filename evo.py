@@ -9,12 +9,17 @@ No stable equilibrium. Ever-evolving.
 
 import random
 import time
+import struct
+import math
+import threading
+import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Set
 
 random.seed()
 
 EXTINCTION_LOG_FILE = "extinction.csv"
+SOUND_ENABLED = True
 
 # --- CONFIG ---
 WIDTH = 64
@@ -129,13 +134,97 @@ class World:
                 [random.randint(g[1], g[2]) for g in GENES],
             )
 
+    SOUND_TONES = {
+        "mass_death": (200, 0.15),
+        "critical":   (100, 0.25),
+        "bottleneck": (150, 0.20),
+        "radiation":  (500, 0.10),
+        "disease":    (320, 0.12),
+        "epidemic":   (250, 0.20),
+        "migration":  (600, 0.10),
+        "fossil":     (700, 0.08),
+        "season":     (400, 0.10),
+        "recovery":   (750, 0.10),
+        "env_shift":  (280, 0.15),
+        "stress":     (180, 0.20),
+    }
+
+    @staticmethod
+    def _play_tone(freq: float, duration: float, volume: float = 0.3):
+        sr = 22050
+        n = int(sr * duration)
+        decay = 1.0
+        data = bytearray()
+        for i in range(n):
+            t = i / sr
+            env = 1.0 - i / n if duration > 0.05 else 1.0
+            s = int(volume * env * 32767 * math.sin(2 * math.pi * freq * t))
+            data.extend(struct.pack("<h", s))
+        try:
+            proc = subprocess.Popen(
+                ["aplay", "-q", "-f", "S16_LE", "-r", str(sr), "-c", "1"],
+                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            proc.communicate(input=bytes(data), timeout=1)
+        except Exception:
+            pass
+
+    def _sound(self, event_type: str):
+        if not SOUND_ENABLED:
+            return
+        tone = self.SOUND_TONES.get(event_type)
+        if tone:
+            threading.Thread(
+                target=World._play_tone, args=tone, daemon=True
+            ).start()
+
     def _log_extinction(self, etype: str, pop: int):
+        orgs = self.organisms
+        n = len(orgs)
+        if n > 0:
+            avg_e = sum(o.energy for o in orgs) / n
+            avg_f = sum(o.fat for o in orgs) / n
+            avg_g = [sum(o.genome[i] for o in orgs) / n for i in range(len(GENES))]
+            n_herb = sum(1 for o in orgs if o.genome[8] == 0)
+            n_carn = sum(1 for o in orgs if o.genome[8] == 1)
+            n_omni = sum(1 for o in orgs if o.genome[8] == 2)
+            sp = len({tuple(o.genome) for o in orgs})
+            gc: Dict[Tuple[int, ...], int] = {}
+            for o in orgs:
+                k = tuple(o.genome)
+                gc[k] = gc.get(k, 0) + 1
+            dom = max(gc, key=gc.get) if gc else ()
+            dom_g = " ".join(str(v) for v in dom)
+        else:
+            avg_e = avg_f = n_herb = n_carn = n_omni = sp = 0
+            avg_g = [0.0] * len(GENES)
+            dom_g = ""
+        cols = [
+            self.tick, etype, pop, self.max_gen_ever, self.season,
+            f"{avg_e:.2f}", f"{avg_f:.3f}",
+            f"{avg_g[0]:.2f}", f"{avg_g[1]:.2f}", f"{avg_g[2]:.2f}",
+            f"{avg_g[3]:.2f}", f"{avg_g[4]:.2f}", f"{avg_g[5]:.2f}",
+            f"{avg_g[6]:.2f}", f"{avg_g[7]:.2f}", f"{avg_g[8]:.2f}", f"{avg_g[9]:.2f}",
+            n_herb, n_carn, n_omni,
+            self.min_pop_ever, self.max_age_ever,
+            sp, self.fossil_count, len(self.diseased), len(self.resources),
+            dom_g,
+        ]
+        header = (
+            "tick,event,pop,max_gen,season,"
+            "avg_energy,avg_fat,"
+            "avg_spd,avg_sen,avg_agg,avg_met,avg_wnd,avg_hue,avg_mut,avg_tmp,avg_diet,avg_tox,"
+            "n_herb,n_carn,n_omni,"
+            "min_pop,max_age,"
+            "species,fossils,diseased,resources,"
+            "dominant_genome"
+        )
         if not self._extinction_log_initialized:
             with open(EXTINCTION_LOG_FILE, "w") as f:
-                f.write("tick,event,pop,max_gen,season\n")
+                f.write(header + "\n")
             self._extinction_log_initialized = True
         with open(EXTINCTION_LOG_FILE, "a") as f:
-            f.write(f"{self.tick},{etype},{pop},{self.max_gen_ever},{self.season}\n")
+            f.write(",".join(str(c) for c in cols) + "\n")
 
     def _add_resource(self, x: int, y: int, rtype: str = "food"):
         self.resources[(x, y)] = rtype
@@ -219,6 +308,7 @@ class World:
             self.events.append(
                 f"🌤️ Season: {'☀ summer' if self.season == 'summer' else '❄ winter'}"
             )
+            self._sound("season")
 
         dead: Set[int] = set()
 
@@ -572,10 +662,12 @@ class World:
         # Population crash event
         if died > 5 and pop_after > 0:
             self.events.append(f"💀 {died} died in a single tick")
+            self._sound("mass_death")
 
         # Population recovery event
         if pre_pop < 10 and pop_after > pre_pop and pop_after >= 10:
             self.events.append(f"🌱 Population recovered to {pop_after}")
+            self._sound("recovery")
 
         # Extinction-level event tracking
         if pop_after < self.min_pop_ever:
@@ -584,11 +676,13 @@ class World:
                 entry = f"⚠ CRITICAL: pop={pop_after} at T={self.tick} (max_gen={self.max_gen_ever})"
                 self.extinction_log.append(entry)
                 self.events.append(f"⚠ Only {pop_after} organisms remain!")
+                self._sound("critical")
                 self._log_extinction("CRITICAL", pop_after)
             elif pop_after <= 10:
                 entry = f"📉 Bottleneck: pop={pop_after} at T={self.tick} (max_gen={self.max_gen_ever})"
                 self.extinction_log.append(entry)
                 self.events.append(f"📉 Population bottleneck: {pop_after}")
+                self._sound("bottleneck")
                 self._log_extinction("BOTTLENECK", pop_after)
 
         # Radiation spike — injects genetic variation
@@ -604,6 +698,7 @@ class World:
                     n_mutated += 1
             if n_mutated > 0:
                 self.events.append(f"☢ Radiation spike — {n_mutated} organisms mutated")
+                self._sound("radiation")
 
         # Spontaneous disease outbreak
         if not self.diseased and len(self.organisms) > 25 and random.random() < 0.03:
@@ -614,8 +709,10 @@ class World:
                 for v in victims:
                     self.diseased.add(v.id)
                 self.events.append(f"🦠 Disease outbreak! {len(victims)} infected")
+                self._sound("disease")
         elif self.diseased and random.random() < 0.002 and len(self.diseased) > 10:
             self.events.append(f"🦠 Epidemic: {len(self.diseased)} infected")
+            self._sound("epidemic")
 
         # --- MIGRATION (invasion from outside) ---
         self.migration_timer -= 1
@@ -629,6 +726,7 @@ class World:
             self.events.append(
                 f"🌊 {batch} invaders arrived from beyond"
             )
+            self._sound("migration")
             self.migration_timer = random.randint(*MIGRATION_INTERVAL)
 
         # --- FOSSIL RECORD: track extinct lineages ---
@@ -643,6 +741,7 @@ class World:
                 f"🦴 {len(newly_extinct)} lineage(s) fossilized "
                 f"(total: {self.fossil_count})"
             )
+            self._sound("fossil")
 
         # --- REGENERATE RESOURCES ---
         regen = SUMMER_REGEN if self.season == "summer" else WINTER_REGEN
@@ -670,10 +769,12 @@ class World:
             f"🌋 Environment shift: -{remove_n} resources, "
             f"+clusters in new locations"
         )
+        self._sound("env_shift")
         if self.tick > 100 and random.random() < 0.25:
             self.events.append(
                 f"🔥 Environmental stress event — all organisms lose energy"
             )
+            self._sound("stress")
         if remove_n > 0 and self.resources:
             for pos in random.sample(
                 list(self.resources.keys()), min(remove_n, len(self.resources))
@@ -880,6 +981,7 @@ def main():
         world._log_extinction("TOTAL_EXTINCTION", 0)
     elif interrupted:
         print(f"  ✦  Evolution halted after {world.tick} ticks")
+        world._log_extinction("SNAPSHOT", len(world.organisms))
     print(f"  Pop: {len(world.organisms)}  "
           f"Generations: {world.max_gen_ever}  "
           f"Max age: {world.max_age_ever}  "
