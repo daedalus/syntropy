@@ -54,6 +54,7 @@ GENES = [
     ("hue", 0, 5),
     ("mut_rate", 0, 5),
     ("thermal", 0, 4),
+    ("diet", 0, 2),
 ]
 
 GLYPH_SET = "●◆▲■★✦⬟⬢"
@@ -167,6 +168,19 @@ class World:
                         best = pos
         return best
 
+    def _nearest_organism(self, org: Organism, dead: Set[int]) -> Optional[Organism]:
+        sense = org.genome[1]
+        best_d = sense + 1
+        best = None
+        for other in self.organisms:
+            if other is org or other.id in dead:
+                continue
+            d = abs(other.x - org.x) + abs(other.y - org.y)
+            if d < best_d:
+                best_d = d
+                best = other
+        return best
+
     def step(self):
         self.tick += 1
         self.shift_timer -= 1
@@ -195,10 +209,32 @@ class World:
 
             org.age += 1
 
+            diet = org.genome[8]
+
             # --- SENSE & MOVE ---
             speed = org.genome[0] + 1
             wander = org.genome[4]
-            target = self._nearest_resource(org)
+
+            # Choose target: organism (carnivore/omnivore) or resource (herbivore/omnivore)
+            target = None
+            if diet >= 1:
+                prey = self._nearest_organism(org, dead)
+                if diet == 1:
+                    # Pure carnivore: hunt organisms only
+                    target = (prey.x, prey.y) if prey else None
+                elif diet == 2:
+                    # Omnivore: chase closest of organism or resource
+                    res_target = self._nearest_resource(org)
+                    if prey and res_target:
+                        p_dist = abs(prey.x - org.x) + abs(prey.y - org.y)
+                        r_dist = abs(res_target[0] - org.x) + abs(res_target[1] - org.y)
+                        target = (prey.x, prey.y) if p_dist <= r_dist else res_target
+                    elif prey:
+                        target = (prey.x, prey.y)
+                    elif res_target:
+                        target = res_target
+            else:
+                target = self._nearest_resource(org)
 
             if target:
                 tx, ty = target
@@ -233,10 +269,14 @@ class World:
             # --- CONSUME RESOURCE ---
             pos = (org.x, org.y)
             if pos in self.resources:
-                rtype = self.resources.pop(pos)
-                base_val = RESOURCE_TYPES[rtype]["value"]
-                met_bonus = 1.0 + org.genome[3] * 0.2
-                org.energy += base_val * met_bonus
+                rtype = self.resources[pos]
+                if diet == 1 and rtype != "corpse":
+                    pass
+                else:
+                    self.resources.pop(pos)
+                    base_val = RESOURCE_TYPES[rtype]["value"]
+                    met_bonus = 1.0 + org.genome[3] * 0.2
+                    org.energy += base_val * met_bonus
 
             # --- METABOLIC COST ---
             base_cost = SUMMER_BASE_COST if self.season == "summer" else WINTER_BASE_COST
@@ -270,6 +310,28 @@ class World:
                     elif a > 0 and random.random() < a / 3:
                         org.energy += other.energy * 0.2
                         dead.add(other.id)
+
+            if org.id in dead:
+                continue
+
+            # --- HUNTING (carnivores actively attack adjacent organisms) ---
+            if diet >= 1:
+                for other in self.organisms:
+                    if other is org or other.id in dead:
+                        continue
+                    if abs(other.x - org.x) <= 1 and abs(other.y - org.y) <= 1:
+                        a = org.genome[2]
+                        b = other.genome[2]
+                        org_power = max(0.1, org.energy) * (a + 1) / 4
+                        other_power = max(0.1, other.energy) * (b + 1) / 4
+                        total = org_power + other_power
+                        if random.random() < org_power / total:
+                            org.energy += other.energy * 0.5
+                            dead.add(other.id)
+                        else:
+                            other.energy += org.energy * 0.3
+                            dead.add(org.id)
+                            break
 
             if org.id in dead:
                 continue
@@ -523,8 +585,16 @@ class World:
 
         for org in self.organisms:
             if 0 <= org.x < WIDTH and 0 <= org.y < HEIGHT:
-                glyph = GLYPH_SET[org.genome[5] % len(GLYPH_SET)]
-                color = COLORS[org.genome[5] % len(COLORS)]
+                diet = org.genome[8]
+                if diet == 1:
+                    glyph = "⬢"
+                    color = COLORS[org.genome[5] % len(COLORS)]
+                elif diet == 2:
+                    glyph = "⬟"
+                    color = COLORS[org.genome[5] % len(COLORS)]
+                else:
+                    glyph = GLYPH_SET[org.genome[5] % len(GLYPH_SET)]
+                    color = COLORS[org.genome[5] % len(COLORS)]
                 if org.id == sentinel_id and org.generation > 0:
                     grid[org.y][org.x] = f"{BOLD}\033[47m\033[30m{glyph}{RESET}"
                 elif org.id in self.diseased:
@@ -553,6 +623,7 @@ class World:
             avg_met = sum(o.genome[3] for o in self.organisms) / n
             avg_mut = sum(o.genome[6] for o in self.organisms) / n
             avg_tmp = sum(o.genome[7] for o in self.organisms) / n
+            avg_diet = sum(o.genome[8] for o in self.organisms) / n
             species = len({tuple(o.genome) for o in self.organisms})
 
             # Dominant genome
@@ -564,7 +635,7 @@ class World:
             dominant_pct = genome_counts.get(dominant_key, 0) / n * 100
             dominant_glyph = GLYPH_SET[dominant_key[5] % len(GLYPH_SET)] if dominant_key else "?"
         else:
-            avg_e = max_g = avg_spd = avg_agg = avg_met = avg_mut = avg_tmp = species = n = 0
+            avg_e = max_g = avg_spd = avg_agg = avg_met = avg_mut = avg_tmp = avg_diet = species = n = 0
             dominant_key = ()
             dominant_pct = 0
             dominant_glyph = "?"
@@ -573,7 +644,7 @@ class World:
             f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  "
             f"Sp:{species:2d}  Spd:{avg_spd:.1f}  "
             f"Agg:{avg_agg:.1f}  Met:{avg_met:.1f}  "
-            f"μMut:{avg_mut:.1f}  Tmp:{avg_tmp:.1f}  "
+            f"μMut:{avg_mut:.1f}  Tm:{avg_tmp:.1f}  D:{avg_diet:.1f}  "
             f"Res:{len(self.resources):3d}  Inf:{len(self.diseased):2d}  "
             f"{'☀' if self.season == 'summer' else '❄'}{'S' if self.season == 'summer' else 'W'}  T:{self.tick}"
         )
@@ -604,7 +675,7 @@ class World:
 
         # Gene frequency bars (compact histogram per gene)
         if self.organisms:
-            labels = ["spd", "sen", "agg", "met", "wnd", "hue", "mut", "tmp"]
+            labels = ["spd", "sen", "agg", "met", "wnd", "hue", "mut", "tmp", "die"]
             bar_parts = []
             for i, (label, (_, g_min, g_max)) in enumerate(zip(labels, GENES)):
                 counts = [0] * (g_max - g_min + 1)
@@ -632,7 +703,7 @@ class World:
             tag = " 🦠" if sentinel.id in self.diseased else ""
             lines.append(
                 f"  {BOLD}\033[47m\033[30m{GLYPH_SET[g[5] % len(GLYPH_SET)]}"
-                f"\033[0m sentinel: [{g[0]} {g[1]} {g[2]} {g[3]} {g[4]} {g[5]} {g[6]} {g[7]}]"
+                f"\033[0m sentinel: [{g[0]} {g[1]} {g[2]} {g[3]} {g[4]} {g[5]} {g[6]} {g[7]} {g[8]}]"
                 f"  gen={sentinel.generation}  age={sentinel.age}  ⚡={sentinel.energy:.1f}{tag}"
             )
 
