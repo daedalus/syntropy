@@ -64,7 +64,8 @@ class Op:
     DUP, JNE = 30, 31
     SWAP, GEN = 32, 33
     PICK, DEPTH = 34, 35
-    TOTAL = 36
+    PC, SETPC = 36, 37
+    TOTAL = 38
 
 # Per-opcode instruction cost (budget consumed per execution)
 OP_COST = [
@@ -87,6 +88,7 @@ OP_COST = [
     0.008, 0.012,  # DUP, JNE
     0.008, 0.010,  # SWAP, GEN
     0.008, 0.006,  # PICK, DEPTH
+    0.006, 0.008,  # PC, SETPC
 ]
 
 class Sensor:
@@ -294,6 +296,11 @@ class GenomeVM:
                     self._sr(a2 % NUM_REGS, 0.0)
             elif op == Op.DEPTH:
                 self._sr(a2 % NUM_REGS, float(len(self.stack)))
+            elif op == Op.PC:
+                self._sr(a2 % NUM_REGS, float(self.pc))
+            elif op == Op.SETPC:
+                new_pc = int(abs(rv))
+                self.pc = (new_pc % max(3, glen)) // 3 * 3
 
         return actions
 
@@ -1510,7 +1517,7 @@ class World:
                 OP_NAMES = ["NOP","MOV","ADD","SUB","MUL","DIV","JMP","JZ","JG","JL",
                             "SENSE","ACT","PUSH","POP","CALL","RET","HALT","RAND","ENERGY",
                             "MOD","CMP","AND","OR","XOR","NOT","IND","MIN","MAX","ABS","NEG","DUP","JNE",
-                            "SWAP","GEN","PICK","DPTH"]
+                            "SWAP","GEN","PICK","DPTH","PC","SETPC"]
                 g = sentinel.genome
                 decoded = []
                 for i in range(0, min(len(g), 54), 3):
