@@ -19,12 +19,12 @@ random.seed()
 # --- CONFIG ---
 WIDTH = 64
 HEIGHT = 22
-INITIAL_ORGANISMS = 50
-INITIAL_RESOURCES = 150
-RESOURCE_REGEN = 4
-RESOURCE_VALUE = 2.0
-REPRODUCTION_THRESHOLD = 6.0
-ENERGY_COST_PER_CHILD = 3.0
+INITIAL_ORGANISMS = 40
+INITIAL_RESOURCES = 180
+RESOURCE_REGEN = 5
+RESOURCE_VALUE = 2.5
+REPRODUCTION_THRESHOLD = 4.5
+ENERGY_COST_PER_CHILD = 2.5
 MUTATION_RATE = 0.12
 ENV_SHIFT_INTERVAL = (30, 60)
 TICK_RATE = 0.06
@@ -70,6 +70,9 @@ class World:
         self.tick = 0
         self.next_id = 0
         self.shift_timer = random.randint(*ENV_SHIFT_INTERVAL)
+        self.events: List[str] = []
+        self.pop_history: List[int] = []
+        self.max_gen_ever = 0
 
         for _ in range(INITIAL_RESOURCES):
             self._add_resource(
@@ -129,6 +132,8 @@ class World:
     def step(self):
         self.tick += 1
         self.shift_timer -= 1
+
+        pre_pop = len(self.organisms)
 
         if self.shift_timer <= 0:
             self._shift_environment()
@@ -246,9 +251,26 @@ class World:
                         nx, ny, child_genome, ENERGY_COST_PER_CHILD, org.generation + 1
                     )
                     org.energy -= ENERGY_COST_PER_CHILD * 1.1
+                    if org.generation + 1 > self.max_gen_ever:
+                        self.max_gen_ever = org.generation + 1
+                        self.events.append(
+                            f"⚡ Gen {self.max_gen_ever} reached! "
+                            f"({GLYPH_SET[child_genome[5] % len(GLYPH_SET)]})"
+                        )
 
         # Remove dead
+        pop_before = len(self.organisms)
         self.organisms = [o for o in self.organisms if o.id not in dead]
+        pop_after = len(self.organisms)
+        died = pop_before - pop_after
+
+        # Population crash event
+        if died > 5 and pop_after > 0:
+            self.events.append(f"💀 {died} died in a single tick")
+
+        # Population recovery event
+        if pre_pop < 10 and pop_after > pre_pop and pop_after >= 10:
+            self.events.append(f"🌱 Population recovered to {pop_after}")
 
         # --- REGENERATE RESOURCES ---
         for _ in range(RESOURCE_REGEN):
@@ -259,6 +281,14 @@ class World:
 
     def _shift_environment(self):
         remove_n = int(len(self.resources) * random.uniform(0.15, 0.4))
+        self.events.append(
+            f"🌋 Environment shift: -{remove_n} resources, "
+            f"+clusters in new locations"
+        )
+        if self.tick > 100 and random.random() < 0.25:
+            self.events.append(
+                f"🔥 Environmental stress event — all organisms lose energy"
+            )
         if remove_n > 0 and self.resources:
             for pos in random.sample(
                 list(self.resources.keys()), min(remove_n, len(self.resources))
@@ -310,8 +340,20 @@ class World:
             avg_agg = sum(o.genome[2] for o in self.organisms) / n
             avg_met = sum(o.genome[3] for o in self.organisms) / n
             species = len({tuple(o.genome) for o in self.organisms})
+
+            # Dominant genome
+            genome_counts: Dict[Tuple[int, ...], int] = {}
+            for o in self.organisms:
+                key = tuple(o.genome)
+                genome_counts[key] = genome_counts.get(key, 0) + 1
+            dominant_key = max(genome_counts, key=genome_counts.get) if genome_counts else ()
+            dominant_pct = genome_counts.get(dominant_key, 0) / n * 100
+            dominant_glyph = GLYPH_SET[dominant_key[5] % len(GLYPH_SET)] if dominant_key else "?"
         else:
-            avg_e = max_g = avg_spd = avg_agg = avg_met = species = 0
+            avg_e = max_g = avg_spd = avg_agg = avg_met = species = n = 0
+            dominant_key = ()
+            dominant_pct = 0
+            dominant_glyph = "?"
 
         lines.append(
             f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  "
@@ -319,6 +361,19 @@ class World:
             f"Agg:{avg_agg:.1f}  Met:{avg_met:.1f}  "
             f"Res:{len(self.resources):3d}  T:{self.tick}"
         )
+
+        # Dominant genome line
+        if dominant_key:
+            genome_str = " ".join(str(g) for g in dominant_key)
+            lines.append(
+                f"  {BOLD}{dominant_glyph}{RESET} dominant: [{genome_str}] "
+                f"({dominant_pct:.0f}% of pop)"
+            )
+
+        # Events (last 3)
+        self.events = self.events[-3:]
+        for ev in self.events:
+            lines.append(f"  {ev}")
         lines.append(
             "  " + "  ".join(
                 f"{COLORS[i]}{GLYPH_SET[i]}{RESET}={GENES[i][0]}"
