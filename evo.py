@@ -18,17 +18,26 @@ random.seed()
 WIDTH = 64
 HEIGHT = 22
 INITIAL_ORGANISMS = 40
-INITIAL_RESOURCES = 100
-RESOURCE_REGEN = 5
-RESOURCE_VALUE = 2.5
+INITIAL_RESOURCES = 80
+RESOURCE_REGEN = 4
 REPRODUCTION_THRESHOLD = 5.0
 SEXUAL_THRESHOLD = 3.0
 ENERGY_COST_PER_CHILD = 2.5
-MUTATION_RATE = 0.12
+BASE_MUTATION_RATE = 0.10
 ENV_SHIFT_INTERVAL = (30, 60)
 MIGRATION_INTERVAL = (80, 150)
 MIGRATION_BATCH = (3, 8)
 TICK_RATE = 0.06
+
+# Two resource types: common food, rare bounty
+RESOURCE_TYPES = {
+    "food":  {"value": 1.5, "symbol": "·", "weight": 0.75},
+    "bounty":{"value": 5.5, "symbol": "★", "weight": 0.25},
+}
+RESOURCE_KEYS = list(RESOURCE_TYPES.keys())
+
+# Mutation rate per gene value (0=low mut, 5=high mut)
+MUT_RATES = [0.02, 0.05, 0.08, 0.12, 0.18, 0.28]
 
 GENES = [
     ("speed", 0, 3),
@@ -37,6 +46,7 @@ GENES = [
     ("metabolic", 0, 3),
     ("wander", 0, 3),
     ("hue", 0, 5),
+    ("mut_rate", 0, 5),
 ]
 
 GLYPH_SET = "●◆▲■★✦"
@@ -67,12 +77,13 @@ class Organism:
 class World:
     def __init__(self):
         self.organisms: List[Organism] = []
-        self.resources: Dict[Tuple[int, int], float] = {}
+        self.resources: Dict[Tuple[int, int], str] = {}
         self.tick = 0
         self.next_id = 0
         self.shift_timer = random.randint(*ENV_SHIFT_INTERVAL)
         self.events: List[str] = []
         self.pop_history: List[int] = []
+        self.fitness_history: List[float] = []
         self.max_gen_ever = 0
         self.max_age_ever = 0
         self.genes_found: List[Set[int]] = [set(range(g[1], g[2]+1)) for g in GENES]
@@ -81,8 +92,9 @@ class World:
         self.fossil_lineages: List[Tuple[int, ...]] = []
 
         for _ in range(INITIAL_RESOURCES):
+            rtype = random.choices(RESOURCE_KEYS, weights=[t["weight"] for t in RESOURCE_TYPES.values()])[0]
             self._add_resource(
-                random.randint(0, WIDTH - 1), random.randint(0, HEIGHT - 1)
+                random.randint(0, WIDTH - 1), random.randint(0, HEIGHT - 1), rtype
             )
 
         for _ in range(INITIAL_ORGANISMS):
@@ -92,8 +104,8 @@ class World:
                 [random.randint(g[1], g[2]) for g in GENES],
             )
 
-    def _add_resource(self, x: int, y: int):
-        self.resources[(x, y)] = RESOURCE_VALUE
+    def _add_resource(self, x: int, y: int, rtype: str = "food"):
+        self.resources[(x, y)] = rtype
 
     def _spawn(
         self, x: int, y: int, genome: list, energy: float = 3.0, generation: int = 0
@@ -111,10 +123,10 @@ class World:
         )
         self.next_id += 1
 
-    def _mutate(self, genome: list) -> list:
+    def _mutate(self, genome: list, mut_rate: float = BASE_MUTATION_RATE) -> list:
         new = list(genome)
         for i in range(len(new)):
-            if random.random() < MUTATION_RATE:
+            if random.random() < mut_rate:
                 g_min, g_max = GENES[i][1], GENES[i][2]
                 delta = random.choice([-1, 1])
                 new[i] = max(g_min, min(g_max, new[i] + delta))
@@ -193,7 +205,8 @@ class World:
             # --- CONSUME RESOURCE ---
             pos = (org.x, org.y)
             if pos in self.resources:
-                org.energy += self.resources.pop(pos)
+                rtype = self.resources.pop(pos)
+                org.energy += RESOURCE_TYPES[rtype]["value"]
 
             # --- METABOLIC COST ---
             org.energy -= 0.08 + org.genome[3] * 0.12
@@ -279,7 +292,7 @@ class World:
                                 child_genome.append(org.genome[i])
                             else:
                                 child_genome.append(mate.genome[i])
-                        child_genome = self._mutate(child_genome)
+                        child_genome = self._mutate(child_genome, MUT_RATES[org.genome[6]])
                         child_gen = max(org.generation, mate.generation) + 1
                         energy_cost = ENERGY_COST_PER_CHILD * 0.7
                         self._spawn(nx, ny, child_genome, energy_cost, child_gen)
@@ -293,7 +306,7 @@ class World:
                             )
                     elif org.energy >= REPRODUCTION_THRESHOLD:
                         # ASEXUAL: clone + mutate
-                        child_genome = self._mutate(org.genome)
+                        child_genome = self._mutate(org.genome, MUT_RATES[org.genome[6]])
                         self._spawn(nx, ny, child_genome, ENERGY_COST_PER_CHILD, org.generation + 1)
                         org.energy -= ENERGY_COST_PER_CHILD * 1.1
                         if org.generation + 1 > self.max_gen_ever:
@@ -364,7 +377,19 @@ class World:
             if len(self.resources) < WIDTH * HEIGHT * 0.25:
                 x, y = random.randint(0, WIDTH - 1), random.randint(0, HEIGHT - 1)
                 if (x, y) not in self.resources:
-                    self._add_resource(x, y)
+                    rtype = random.choices(
+                        RESOURCE_KEYS,
+                        weights=[t["weight"] for t in RESOURCE_TYPES.values()]
+                    )[0]
+                    self._add_resource(x, y, rtype)
+
+        # Track fitness
+        if self.organisms:
+            self.fitness_history.append(
+                sum(o.energy for o in self.organisms) / len(self.organisms)
+            )
+        if len(self.fitness_history) > 80:
+            self.fitness_history = self.fitness_history[-80:]
 
     def _shift_environment(self):
         remove_n = int(len(self.resources) * random.uniform(0.15, 0.4))
@@ -390,7 +415,8 @@ class World:
                 x = max(0, min(WIDTH - 1, cx + random.randint(-4, 4)))
                 y = max(0, min(HEIGHT - 1, cy + random.randint(-2, 2)))
                 if (x, y) not in self.resources:
-                    self._add_resource(x, y)
+                    rtype = random.choices(RESOURCE_KEYS, weights=[t["weight"] for t in RESOURCE_TYPES.values()])[0]
+                    self._add_resource(x, y, rtype)
 
         if random.random() < 0.3:
             for org in self.organisms:
@@ -399,12 +425,11 @@ class World:
     def render(self) -> str:
         grid = [[" " for _ in range(WIDTH)] for _ in range(HEIGHT)]
 
-        for (x, y), _ in self.resources.items():
+        for (x, y), rtype in self.resources.items():
             if 0 <= x < WIDTH and 0 <= y < HEIGHT:
-                # Only draw if no organism is there (organisms drawn on top)
                 occupied = any(o.x == x and o.y == y for o in self.organisms)
                 if not occupied:
-                    grid[y][x] = "·"
+                    grid[y][x] = RESOURCE_TYPES[rtype]["symbol"]
 
         # Find sentinel (most-evolved organism)
         sentinel = max(self.organisms, key=lambda o: o.generation) if self.organisms else None
@@ -436,6 +461,7 @@ class World:
             avg_spd = sum(o.genome[0] for o in self.organisms) / n
             avg_agg = sum(o.genome[2] for o in self.organisms) / n
             avg_met = sum(o.genome[3] for o in self.organisms) / n
+            avg_mut = sum(o.genome[6] for o in self.organisms) / n
             species = len({tuple(o.genome) for o in self.organisms})
 
             # Dominant genome
@@ -456,6 +482,7 @@ class World:
             f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  "
             f"Sp:{species:2d}  Speed:{avg_spd:.1f}  "
             f"Agg:{avg_agg:.1f}  Met:{avg_met:.1f}  "
+            f"μMut:{avg_mut:.1f}  "
             f"Res:{len(self.resources):3d}  MaxAge:{self.max_age_ever:3d}  T:{self.tick}"
         )
 
@@ -472,9 +499,20 @@ class World:
                 sparkline += SPARK[idx]
             lines.append(f"  └{'─' * min(50, len(window))}  {sparkline}")
 
+        # Fitness sparkline (rolling avg energy)
+        if len(self.fitness_history) > 5:
+            feats = self.fitness_history[-40:]
+            mn, mx = min(feats), max(feats)
+            rng = mx - mn if mx > mn else 1
+            fitline = ""
+            for f in feats:
+                idx = int((f - mn) / rng * 7)
+                fitline += "▁▂▃▄▅▆▇█"[idx]
+            lines.append(f"  └fit              {fitline}")
+
         # Gene frequency bars (compact histogram per gene)
         if self.organisms:
-            labels = ["spd", "sen", "agg", "met", "wnd", "hue"]
+            labels = ["spd", "sen", "agg", "met", "wnd", "hue", "mut"]
             bar_parts = []
             for i, (label, (_, g_min, g_max)) in enumerate(zip(labels, GENES)):
                 counts = [0] * (g_max - g_min + 1)
@@ -503,8 +541,8 @@ class World:
         lines.append(
             "  " + "  ".join(
                 f"{COLORS[i]}{GLYPH_SET[i]}{RESET}={GENES[i][0]}"
-                for i in range(len(GENES))
-            )
+                for i in range(min(len(GENES), len(GLYPH_SET)))
+            ) + f"  {BOLD}★{RESET}=bounty"
         )
         return "\n".join(lines)
 
