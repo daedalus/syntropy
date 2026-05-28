@@ -1,10 +1,8 @@
-tick,event,pop,max_gen,season
-155,BOTTLENECK,9,27,winter
-156,BOTTLENECK,7,27,winter
-157,BOTTLENECK,6,27,winter
-159,BOTTLENECK,5,27,winter
-162,BOTTLENECK,4,27,winter
-164,CRITICAL,3,27,winter
-178,CRITICAL,2,27,winter
-2839,BOTTLENECK,4,312,winter
-2840,CRITICAL,2,312,winter
+tick,event,pop,max_gen,season,avg_energy,avg_fat,avg_spd,avg_sen,avg_agg,avg_met,avg_wnd,avg_hue,avg_mut,avg_tmp,avg_diet,avg_tox,n_herb,n_carn,n_omni,min_pop,max_age,species,fossils,diseased,resources,dominant_genome
+134,BOTTLENECK,9,14,winter,1.43,0.765,2.78,3.11,2.33,0.67,0.67,2.78,3.78,2.56,0.33,0.67,7,1,1,9,73,9,418,0,22,3 0 1 0 1 5 4 3 0 0
+137,BOTTLENECK,7,14,winter,1.47,0.633,3.00,3.00,2.43,0.29,0.86,2.71,4.29,2.57,0.29,0.43,5,2,0,7,73,7,427,0,26,3 4 3 0 0 4 5 2 0 1
+139,BOTTLENECK,6,14,winter,1.45,0.500,3.00,3.00,2.33,0.17,0.83,2.67,4.17,2.33,0.33,0.33,4,2,0,6,73,6,427,0,30,3 0 1 0 2 5 4 3 0 0
+141,BOTTLENECK,5,14,winter,1.54,0.723,3.00,3.00,2.20,0.00,1.00,1.60,4.00,2.20,0.20,0.40,4,1,0,5,73,4,427,0,34,3 4 3 0 0 0 5 2 0 1
+570,BOTTLENECK,4,67,winter,0.78,0.500,2.50,4.00,2.75,0.00,1.75,1.50,1.75,3.50,0.00,1.75,4,0,0,4,89,4,1290,0,49,3 4 2 0 1 2 2 4 0 2
+571,CRITICAL,3,67,winter,1.24,0.667,2.33,4.00,3.00,0.00,2.00,1.33,1.67,3.33,0.00,1.67,3,0,0,3,89,3,1291,0,50,2 4 3 0 2 3 3 3 0 2
+729,CRITICAL,2,88,winter,2.89,1.000,2.50,4.00,2.50,0.00,3.00,0.50,1.50,3.50,0.00,2.00,2,0,0,2,89,2,1592,0,69,3 4 2 0 3 1 3 3 0 2

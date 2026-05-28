@@ -84,6 +84,27 @@ RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 
+GENUS_ROOTS = [
+    "Velox", "Altus", "Lentus", "Celer", "Fortis",
+    "Sapiens", "Audax", "Placidus", "Mobilis", "Rusticus",
+]
+SPECIES_ROOTS = [
+    "herba", "carnis", "omnis", "toxica", "therma",
+    "chroma", "mutans", "agilis", "dorma", "vigil",
+]
+_name_cache: Dict[Tuple[int, ...], str] = {}
+
+def _species_name(genome: tuple) -> str:
+    if genome in _name_cache:
+        return _name_cache[genome]
+    g = genome
+    idx1 = (g[0] * 7 + g[2] * 5 + g[4] * 3 + g[6]) % len(GENUS_ROOTS)
+    idx2 = (g[1] * 11 + g[3] * 7 + g[5] * 5 + g[7] * 3 + g[8] * 2 + g[9]) % len(SPECIES_ROOTS)
+    variant = (g[0] * 13 + g[3] * 17 + g[6] * 19) % 100
+    name = f"{GENUS_ROOTS[idx1]} {SPECIES_ROOTS[idx2]} v.{variant}"
+    _name_cache[genome] = name
+    return name
+
 
 @dataclass
 class Organism:
@@ -327,6 +348,11 @@ class World:
 
             diet = org.genome[8]
 
+            # --- LIFE STAGE: juvenile penalty, elder bonus ---
+            if org.age < 3:
+                org.energy -= 0.05
+            is_elder = org.age > 30
+
             # --- SENSE & MOVE ---
             speed = org.genome[0] + 1
             wander = org.genome[4]
@@ -545,25 +571,38 @@ class World:
                 dead.add(org.id)
                 continue
 
+            # --- DENSITY-DEPENDENT FERTILITY ---
+            local_density = sum(
+                1 for o in self.organisms
+                if o is not org and o.id not in dead
+                and abs(o.x - org.x) + abs(o.y - org.y) <= 3
+            )
+            density_penalty = 1.0 + max(0, local_density - 3) * 0.15
+
             # --- REPRODUCTION ---
+            repro_thresh = REPRODUCTION_THRESHOLD * density_penalty
+            sex_thresh = SEXUAL_THRESHOLD * density_penalty
+            if is_elder:
+                repro_thresh *= 0.8
+                sex_thresh *= 0.8
             if (
-                org.energy >= REPRODUCTION_THRESHOLD
-                or (org.energy >= SEXUAL_THRESHOLD
+                org.energy >= repro_thresh
+                or (org.energy >= sex_thresh
                     and any(
                         o is not org and o.id not in dead
-                        and o.energy >= SEXUAL_THRESHOLD
+                        and o.energy >= sex_thresh
                         and abs(o.x - org.x) <= 1 and abs(o.y - org.y) <= 1
                         for o in self.organisms
                     ))
             ):
                 # Try to find a mate for sexual reproduction
                 mate = None
-                # Only seek mate if both have >= SEXUAL_THRESHOLD
-                if org.energy >= SEXUAL_THRESHOLD:
+                # Only seek mate if both have >= sex_thresh
+                if org.energy >= sex_thresh:
                     for other in self.organisms:
                         if other is org or other.id in dead:
                             continue
-                        if other.energy >= SEXUAL_THRESHOLD:
+                        if other.energy >= sex_thresh:
                             dx = abs(other.x - org.x)
                             dy = abs(other.y - org.y)
                             if dx <= 1 and dy <= 1:
@@ -877,22 +916,26 @@ class World:
             dominant_key = max(genome_counts, key=genome_counts.get) if genome_counts else ()
             dominant_pct = genome_counts.get(dominant_key, 0) / n * 100
             dominant_glyph = GLYPH_SET[dominant_key[5] % len(GLYPH_SET)] if dominant_key else "?"
+            shannon = -sum((c/n) * math.log(c/n) for c in genome_counts.values()) if genome_counts else 0.0
+            avg_age = sum(o.age for o in self.organisms) / n
         else:
             avg_e = max_g = avg_spd = avg_agg = avg_met = avg_mut = avg_tmp = avg_diet = avg_tox = avg_fat = species = n = 0
             n_herb = n_carn = n_omni = 0
             dominant_key = ()
             dominant_pct = 0
             dominant_glyph = "?"
+            shannon = 0.0
+            avg_age = 0.0
 
         lines.append(
-            f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  "
-            f"Sp:{species:2d}  Fos:{self.fossil_count:4d}  "
+            f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  Age:{avg_age:.1f}  "
+            f"Sp:{species:2d}  H\u2019:{shannon:.2f}  Fos:{self.fossil_count:4d}  "
             f"H:{n_herb} C:{n_carn} O:{n_omni}  Spd:{avg_spd:.1f}  "
             f"Agg:{avg_agg:.1f}  Met:{avg_met:.1f}  "
-            f"μMut:{avg_mut:.1f}  Tm:{avg_tmp:.1f}  D:{avg_diet:.1f}  Tx:{avg_tox:.1f}  "
+            f"\u03bcMut:{avg_mut:.1f}  Tm:{avg_tmp:.1f}  Tx:{avg_tox:.1f}  "
             f"Ft:{avg_fat:.2f}  "
             f"Res:{len(self.resources):3d}  Inf:{len(self.diseased):2d}  "
-            f"{'☀' if self.season == 'summer' else '❄'}{'S' if self.season == 'summer' else 'W'}  T:{self.tick}"
+            f"{'☀' if self.season == 'summer' else '\u2744'}{'S' if self.season == 'summer' else 'W'}  T:{self.tick}"
         )
 
         # Population sparkline (compact)
@@ -939,7 +982,7 @@ class World:
         if dominant_key:
             genome_str = " ".join(str(g) for g in dominant_key)
             lines.append(
-                f"  {BOLD}{dominant_glyph}{RESET} dominant: [{genome_str}] "
+                f"  {BOLD}{dominant_glyph}{RESET} {_species_name(dominant_key)}: [{genome_str}] "
                 f"({dominant_pct:.0f}% of pop)"
             )
 
@@ -949,7 +992,7 @@ class World:
             tag = " 🦠" if sentinel.id in self.diseased else ""
             lines.append(
                 f"  {BOLD}\033[47m\033[30m{GLYPH_SET[g[5] % len(GLYPH_SET)]}"
-                f"\033[0m sentinel: [{g[0]} {g[1]} {g[2]} {g[3]} {g[4]} {g[5]} {g[6]} {g[7]} {g[8]} {g[9]}]"
+                f"\033[0m {_species_name(tuple(g))}: [{g[0]} {g[1]} {g[2]} {g[3]} {g[4]} {g[5]} {g[6]} {g[7]} {g[8]} {g[9]}]"
                 f"  gen={sentinel.generation}  age={sentinel.age}  ⚡={sentinel.energy:.1f}{tag}"
             )
 
