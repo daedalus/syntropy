@@ -1354,10 +1354,11 @@ class World:
                 f"{'☀ sum' if self.season == 'summer' else '\u2744 win'}  T:{self.tick}"
             )
 
-            # Day-night terminator bar
-            term = int(phase * WIDTH)
+            # Day-night bar (fit within typical terminal width)
+            n = min(WIDTH, 60)
+            step = max(1, WIDTH // n)
             dn_bar = ""
-            for x in range(WIDTH):
+            for x in range(0, WIDTH, step):
                 dl = self._daylight_at(x, phase)
                 if dl > 0.6:
                     dn_bar += "░"
@@ -1365,7 +1366,7 @@ class World:
                     dn_bar += "▒"
                 else:
                     dn_bar += "█"
-            lines.append(f"  [day-night] {dn_bar}")
+            lines.append(f"  [dn] {dn_bar}")
 
             # Population sparkline
             if self.pop_history:
