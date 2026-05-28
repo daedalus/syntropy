@@ -14,6 +14,8 @@ from typing import Dict, List, Tuple, Optional, Set
 
 random.seed()
 
+EXTINCTION_LOG_FILE = "extinction.csv"
+
 # --- CONFIG ---
 WIDTH = 64
 HEIGHT = 22
@@ -43,7 +45,7 @@ RESOURCE_TYPES = {
 RESOURCE_KEYS = list(RESOURCE_TYPES.keys())
 
 # Mutation rate per gene value (0=low mut, 5=high mut)
-MUT_RATES = [0.05, 0.08, 0.12, 0.16, 0.22, 0.30]
+MUT_RATES = [0.08, 0.12, 0.16, 0.20, 0.24, 0.30]
 
 GENES = [
     ("speed", 0, 3),
@@ -55,9 +57,10 @@ GENES = [
     ("mut_rate", 0, 5),
     ("thermal", 0, 4),
     ("diet", 0, 2),
+    ("toxin", 0, 3),
 ]
 
-GLYPH_SET = "●◆▲■★✦⬟⬢"
+GLYPH_SET = "●◆▲■★✦⬟⬢◈◎"
 COLORS = [
     "\033[31m",
     "\033[33m",
@@ -67,6 +70,8 @@ COLORS = [
     "\033[35m",
     "\033[91m",
     "\033[95m",
+    "\033[92m",
+    "\033[93m",
 ]
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -92,10 +97,13 @@ class World:
         self.next_id = 0
         self.shift_timer = random.randint(*ENV_SHIFT_INTERVAL)
         self.events: List[str] = []
+        self.extinction_log: List[str] = []
         self.pop_history: List[int] = []
         self.fitness_history: List[float] = []
+        self._extinction_log_initialized = False
         self.max_gen_ever = 0
         self.max_age_ever = 0
+        self.min_pop_ever = INITIAL_ORGANISMS
         self.genes_found: List[Set[int]] = [set(range(g[1], g[2]+1)) for g in GENES]
         self.genes_lost: List[str] = []
         self.migration_timer = random.randint(*MIGRATION_INTERVAL)
@@ -116,6 +124,14 @@ class World:
                 random.randint(0, HEIGHT - 1),
                 [random.randint(g[1], g[2]) for g in GENES],
             )
+
+    def _log_extinction(self, etype: str, pop: int):
+        if not self._extinction_log_initialized:
+            with open(EXTINCTION_LOG_FILE, "w") as f:
+                f.write("tick,event,pop,max_gen,season\n")
+            self._extinction_log_initialized = True
+        with open(EXTINCTION_LOG_FILE, "a") as f:
+            f.write(f"{self.tick},{etype},{pop},{self.max_gen_ever},{self.season}\n")
 
     def _add_resource(self, x: int, y: int, rtype: str = "food"):
         self.resources[(x, y)] = rtype
@@ -269,14 +285,14 @@ class World:
             # --- CONSUME RESOURCE ---
             pos = (org.x, org.y)
             if pos in self.resources:
-                rtype = self.resources[pos]
-                if diet == 1 and rtype != "corpse":
-                    pass
-                else:
-                    self.resources.pop(pos)
-                    base_val = RESOURCE_TYPES[rtype]["value"]
-                    met_bonus = 1.0 + org.genome[3] * 0.2
-                    org.energy += base_val * met_bonus
+                rtype = self.resources.pop(pos)
+                base_val = RESOURCE_TYPES[rtype]["value"]
+                met_bonus = 1.0 + org.genome[3] * 0.2
+                if diet == 0:
+                    met_bonus += 0.3
+                elif diet == 1 and rtype == "corpse":
+                    met_bonus += 0.4
+                org.energy += base_val * met_bonus
 
             # --- METABOLIC COST ---
             base_cost = SUMMER_BASE_COST if self.season == "summer" else WINTER_BASE_COST
@@ -284,10 +300,13 @@ class World:
             speed_cost = org.genome[0] * 0.02
             sense_cost = org.genome[1] * 0.025
             agg_cost = org.genome[2] * 0.015
+            if diet == 2:
+                agg_cost += 0.02
+            tox_cost = org.genome[9] * 0.01
             pref_temp = org.genome[7] / 4.0
             actual_temp = self._temperature_at(org.y)
             thermal_cost = abs(actual_temp - pref_temp) * 0.25
-            org.energy -= base_cost + speed_cost + sense_cost + agg_cost + thermal_cost
+            org.energy -= base_cost + speed_cost + sense_cost + agg_cost + thermal_cost + tox_cost
 
             # --- FIGHT (overlapping organisms) ---
             for other in self.organisms:
@@ -322,15 +341,26 @@ class World:
                     if abs(other.x - org.x) <= 1 and abs(other.y - org.y) <= 1:
                         a = org.genome[2]
                         b = other.genome[2]
-                        org_power = max(0.1, org.energy) * (a + 1) / 4
+                        atk_mult = 1.5 if diet == 1 else 1.0
+                        org_power = max(0.1, org.energy) * (a + 1) / 4 * atk_mult
                         other_power = max(0.1, other.energy) * (b + 1) / 4
                         total = org_power + other_power
                         if random.random() < org_power / total:
-                            org.energy += other.energy * 0.5
+                            gain = other.energy * 0.6
+                            if diet == 1:
+                                gain *= 1.3
+                            org.energy += gain
+                            # Prey toxin damages predator
+                            tox = other.genome[9]
+                            if tox > 0:
+                                org.energy -= tox * 0.4
                             dead.add(other.id)
+                            break  # satiated for this tick
                         else:
-                            other.energy += org.energy * 0.3
-                            dead.add(org.id)
+                            # Failed hunt — prey fights back, predator injured
+                            org.energy -= other.energy * 0.2
+                            if org.energy <= 0:
+                                dead.add(org.id)
                             break
 
             if org.id in dead:
@@ -493,6 +523,34 @@ class World:
         if pre_pop < 10 and pop_after > pre_pop and pop_after >= 10:
             self.events.append(f"🌱 Population recovered to {pop_after}")
 
+        # Extinction-level event tracking
+        if pop_after < self.min_pop_ever:
+            self.min_pop_ever = pop_after
+            if pop_after <= 3:
+                entry = f"⚠ CRITICAL: pop={pop_after} at T={self.tick} (max_gen={self.max_gen_ever})"
+                self.extinction_log.append(entry)
+                self.events.append(f"⚠ Only {pop_after} organisms remain!")
+                self._log_extinction("CRITICAL", pop_after)
+            elif pop_after <= 10:
+                entry = f"📉 Bottleneck: pop={pop_after} at T={self.tick} (max_gen={self.max_gen_ever})"
+                self.extinction_log.append(entry)
+                self.events.append(f"📉 Population bottleneck: {pop_after}")
+                self._log_extinction("BOTTLENECK", pop_after)
+
+        # Radiation spike — injects genetic variation
+        if self.tick > 50 and random.random() < 0.008:
+            n_mutated = 0
+            for org in self.organisms:
+                i = random.randint(0, len(GENES) - 1)
+                g_min, g_max = GENES[i][1], GENES[i][2]
+                delta = random.choice([-1, 1])
+                old = org.genome[i]
+                org.genome[i] = max(g_min, min(g_max, org.genome[i] + delta))
+                if org.genome[i] != old:
+                    n_mutated += 1
+            if n_mutated > 0:
+                self.events.append(f"☢ Radiation spike — {n_mutated} organisms mutated")
+
         # Spontaneous disease outbreak
         if not self.diseased and len(self.organisms) > 25 and random.random() < 0.03:
             candidates = [o for o in self.organisms if o.energy > 1.5]
@@ -599,6 +657,8 @@ class World:
                     grid[org.y][org.x] = f"{BOLD}\033[47m\033[30m{glyph}{RESET}"
                 elif org.id in self.diseased:
                     grid[org.y][org.x] = f"{BOLD}\033[41m{color}{glyph}{RESET}"
+                elif org.genome[9] > 0:
+                    grid[org.y][org.x] = f"{BOLD}\033[45m{color}{glyph}{RESET}"
                 elif org.energy > 7:
                     grid[org.y][org.x] = f"{BOLD}{color}{glyph}{RESET}"
                 elif org.energy > 3:
@@ -624,6 +684,7 @@ class World:
             avg_mut = sum(o.genome[6] for o in self.organisms) / n
             avg_tmp = sum(o.genome[7] for o in self.organisms) / n
             avg_diet = sum(o.genome[8] for o in self.organisms) / n
+            avg_tox = sum(o.genome[9] for o in self.organisms) / n
             species = len({tuple(o.genome) for o in self.organisms})
 
             # Dominant genome
@@ -635,7 +696,7 @@ class World:
             dominant_pct = genome_counts.get(dominant_key, 0) / n * 100
             dominant_glyph = GLYPH_SET[dominant_key[5] % len(GLYPH_SET)] if dominant_key else "?"
         else:
-            avg_e = max_g = avg_spd = avg_agg = avg_met = avg_mut = avg_tmp = avg_diet = species = n = 0
+            avg_e = max_g = avg_spd = avg_agg = avg_met = avg_mut = avg_tmp = avg_diet = avg_tox = species = n = 0
             dominant_key = ()
             dominant_pct = 0
             dominant_glyph = "?"
@@ -644,7 +705,7 @@ class World:
             f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  "
             f"Sp:{species:2d}  Spd:{avg_spd:.1f}  "
             f"Agg:{avg_agg:.1f}  Met:{avg_met:.1f}  "
-            f"μMut:{avg_mut:.1f}  Tm:{avg_tmp:.1f}  D:{avg_diet:.1f}  "
+            f"μMut:{avg_mut:.1f}  Tm:{avg_tmp:.1f}  D:{avg_diet:.1f}  Tx:{avg_tox:.1f}  "
             f"Res:{len(self.resources):3d}  Inf:{len(self.diseased):2d}  "
             f"{'☀' if self.season == 'summer' else '❄'}{'S' if self.season == 'summer' else 'W'}  T:{self.tick}"
         )
@@ -675,7 +736,7 @@ class World:
 
         # Gene frequency bars (compact histogram per gene)
         if self.organisms:
-            labels = ["spd", "sen", "agg", "met", "wnd", "hue", "mut", "tmp", "die"]
+            labels = ["spd", "sen", "agg", "met", "wnd", "hue", "mut", "tmp", "die", "tox"]
             bar_parts = []
             for i, (label, (_, g_min, g_max)) in enumerate(zip(labels, GENES)):
                 counts = [0] * (g_max - g_min + 1)
@@ -703,7 +764,7 @@ class World:
             tag = " 🦠" if sentinel.id in self.diseased else ""
             lines.append(
                 f"  {BOLD}\033[47m\033[30m{GLYPH_SET[g[5] % len(GLYPH_SET)]}"
-                f"\033[0m sentinel: [{g[0]} {g[1]} {g[2]} {g[3]} {g[4]} {g[5]} {g[6]} {g[7]} {g[8]}]"
+                f"\033[0m sentinel: [{g[0]} {g[1]} {g[2]} {g[3]} {g[4]} {g[5]} {g[6]} {g[7]} {g[8]} {g[9]}]"
                 f"  gen={sentinel.generation}  age={sentinel.age}  ⚡={sentinel.energy:.1f}{tag}"
             )
 
@@ -723,6 +784,7 @@ class World:
 def main():
     world = World()
     print("\033c", end="")
+    interrupted = False
     try:
         while world.organisms:
             print(world.render())
@@ -730,20 +792,41 @@ def main():
             time.sleep(TICK_RATE)
             print("\033[H", end="")
     except KeyboardInterrupt:
-        total_extinct = sum(
-            len(set(range(g[1], g[2]+1)) - world.genes_found[i])
-            for i, g in enumerate(GENES)
-        )
-        print(f"\n\n{'═' * 40}")
+        interrupted = True
+
+    total_extinct = sum(
+        len(set(range(g[1], g[2]+1)) - world.genes_found[i])
+        for i, g in enumerate(GENES)
+    )
+    print(f"\n\n{'═' * 40}")
+    if not world.organisms:
+        print(f"  ✦  All organisms went extinct at T={world.tick}")
+        world._log_extinction("TOTAL_EXTINCTION", 0)
+    elif interrupted:
         print(f"  ✦  Evolution halted after {world.tick} ticks")
-        print(f"  Pop: {len(world.organisms)}  "
-              f"Generations: {world.max_gen_ever}  "
-              f"Max age: {world.max_age_ever}  ")
-        print(f"  Species now: {len({tuple(o.genome) for o in world.organisms})}  "
-              f"Infected: {len(world.diseased)}")
-        if total_extinct:
-            print(f"  Gene values lost to extinction: {total_extinct}")
-        print(f"{'═' * 40}")
+    print(f"  Pop: {len(world.organisms)}  "
+          f"Generations: {world.max_gen_ever}  "
+          f"Max age: {world.max_age_ever}  "
+          f"Min pop: {world.min_pop_ever}")
+    print(f"  Species now: {len({tuple(o.genome) for o in world.organisms})}  "
+          f"Infected: {len(world.diseased)}")
+    if total_extinct:
+        print(f"  Gene values lost to extinction: {total_extinct}")
+    if world.extinction_log:
+        print(f"\n  {'─' * 36}")
+        print(f"  Extinction events ({len(world.extinction_log)} total):")
+        for entry in world.extinction_log[-5:]:
+            print(f"  {entry}")
+    print(f"\n  Extinction log written to {EXTINCTION_LOG_FILE}")
+    if not world.organisms:
+        print(f"\n  Extinction cause: Last {len(world.organisms)} organism(s)")
+        if world.organisms:
+            last = world.organisms[0]
+            print(f"  Genome: [{last.genome[0]} {last.genome[1]} {last.genome[2]} "
+                  f"{last.genome[3]} {last.genome[4]} {last.genome[5]} "
+                  f"{last.genome[6]} {last.genome[7]} {last.genome[8]} {last.genome[9]}]")
+            print(f"  Age: {last.age}  Energy: {last.energy:.1f}")
+    print(f"{'═' * 40}")
 
 
 if __name__ == "__main__":
