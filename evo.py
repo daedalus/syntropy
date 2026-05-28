@@ -17,15 +17,18 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Set
 
-random.seed()
+
+seed = 42
+random.seed(seed)
 
 EXTINCTION_LOG_FILE = "extinction.csv"
 SOUND_ENABLED = True
 SOUND_VOLUME = 0.3
 
-# --- CONFIG ---
-WIDTH = 64
-HEIGHT = 22
+# --- CONFIG --
+M=1.3
+WIDTH = 128
+HEIGHT = 26
 INITIAL_ORGANISMS = 40
 INITIAL_RESOURCES = 80
 RESOURCE_REGEN = 4
@@ -148,6 +151,7 @@ class World:
         self.diseased: Set[int] = set()
         self.sonify_counter = 0
         self.predator_memory: Dict[int, Set[int]] = {}  # predator_hue → set of toxic_hues
+        self.soil_fertility: Dict[Tuple[int, int], float] = {}  # grazed spots → fertility bonus
 
         for _ in range(INITIAL_RESOURCES):
             rtype = random.choices(RESOURCE_KEYS, weights=[t["weight"] for t in RESOURCE_TYPES.values()])[0]
@@ -270,7 +274,7 @@ class World:
             avg_g = [0.0] * len(GENES)
             dom_g = ""
         cols = [
-            self.tick, etype, pop, self.max_gen_ever, self.season,
+            time.strftime("%Y%m%d_%H%M%S"), self.tick, etype, pop, self.max_gen_ever, self.season,
             f"{avg_e:.2f}", f"{avg_f:.3f}",
             f"{avg_g[0]:.2f}", f"{avg_g[1]:.2f}", f"{avg_g[2]:.2f}",
             f"{avg_g[3]:.2f}", f"{avg_g[4]:.2f}", f"{avg_g[5]:.2f}",
@@ -281,7 +285,7 @@ class World:
             dom_g,
         ]
         header = (
-            "tick,event,pop,max_gen,season,"
+            "run_ts,tick,event,pop,max_gen,season,"
             "avg_energy,avg_fat,"
             "avg_spd,avg_sen,avg_agg,avg_met,avg_wnd,avg_hue,avg_mut,avg_tmp,avg_diet,avg_tox,"
             "n_herb,n_carn,n_omni,"
@@ -459,7 +463,19 @@ class World:
                     if d < min_d:
                         min_d = d
                         nearest_pred = other
-                if nearest_pred and random.random() < 0.6:
+                if nearest_pred:
+                    flee_p = 0.6
+                    # Sentinel alarm: high-sense herbivores amplify fear
+                    for sentinel in self.organisms:
+                        if sentinel is org or sentinel.id in dead or sentinel.genome[8] != 0:
+                            continue
+                        if sentinel.genome[1] >= 3 and abs(sentinel.x - nearest_pred.x) <= 3 and abs(sentinel.y - nearest_pred.y) <= 3:
+                            flee_p = 0.9
+                            break
+                    if random.random() < flee_p:
+                        fx = org.x + (org.x - nearest_pred.x)
+                        fy = org.y + (org.y - nearest_pred.y)
+                        target = (max(0, min(WIDTH-1, fx)), max(0, min(HEIGHT-1, fy)))
                     fx = org.x + (org.x - nearest_pred.x)
                     fy = org.y + (org.y - nearest_pred.y)
                     target = (max(0, min(WIDTH-1, fx)), max(0, min(HEIGHT-1, fy)))
@@ -522,6 +538,16 @@ class World:
                 if org.memory and random.random() < 0.02:
                     org.memory.pop(random.randrange(len(org.memory)))
 
+            # --- HORIZONTAL GENE TRANSFER (swap genes with adjacent organisms) ---
+            if not torpid and random.random() < 0.03:
+                for hgt_other in self.organisms:
+                    if hgt_other is org or hgt_other.id in dead:
+                        continue
+                    if abs(hgt_other.x - org.x) <= 1 and abs(hgt_other.y - org.y) <= 1:
+                        i = random.randrange(len(GENES))
+                        org.genome[i], hgt_other.genome[i] = hgt_other.genome[i], org.genome[i]
+                        break
+
             # --- CONSUME RESOURCE ---
             pos = (org.x, org.y)
             if not torpid and pos in self.resources:
@@ -533,11 +559,19 @@ class World:
                 elif diet == 1 and rtype == "corpse":
                     met_bonus += 0.4
                 org.energy += base_val * met_bonus
+                # Soil fertility bonus from previous grazing
+                fert = self.soil_fertility.get(pos, 0.0)
+                if fert > 0 and rtype in ("food", "bounty"):
+                    org.energy += fert * 0.2
+                    self.soil_fertility[pos] = max(0.0, fert - 0.05)
                 # Spatial memory: remember good foraging spots
                 if rtype in ("food", "bounty"):
                     org.memory.append(pos)
                     if len(org.memory) > 3:
                         org.memory.pop(0)
+                # Niche construction: herbivores enrich soil
+                if diet == 0 and rtype == "food":
+                    self.soil_fertility[pos] = self.soil_fertility.get(pos, 0.0) + 0.1
 
             # --- METABOLIC COST ---
             base_cost = SUMMER_BASE_COST if self.season == "summer" else WINTER_BASE_COST
@@ -721,7 +755,8 @@ class World:
                 continue
 
             # --- OLD AGE ---
-            max_age = 180 // (org.genome[3] + 1) + 60
+            size = org.genome[0] + org.genome[2]
+            max_age = 180 // (org.genome[3] + 1) + 60 + size * 5
             if org.age > max_age:
                 dead.add(org.id)
                 continue
@@ -787,7 +822,8 @@ class World:
                                 child_genome.append(mate.genome[i])
                         child_genome = self._mutate(child_genome, MUT_RATES[org.genome[6]])
                         child_gen = max(org.generation, mate.generation) + 1
-                        energy_cost = ENERGY_COST_PER_CHILD * 0.7
+                        size = org.genome[0] + org.genome[2]
+                        energy_cost = ENERGY_COST_PER_CHILD * 0.7 * (1.0 + size * 0.08)
                         child = self._spawn(nx, ny, child_genome, energy_cost, child_gen)
                         org.pupils[child.id] = 5
                         if mate is not org:
@@ -804,9 +840,11 @@ class World:
                     elif org.energy >= repro_thresh:
                         # ASEXUAL: clone + mutate
                         child_genome = self._mutate(org.genome, MUT_RATES[org.genome[6]])
-                        child = self._spawn(nx, ny, child_genome, ENERGY_COST_PER_CHILD, org.generation + 1)
+                        size = org.genome[0] + org.genome[2]
+                        cost_mult = 1.0 + size * 0.08
+                        child = self._spawn(nx, ny, child_genome, ENERGY_COST_PER_CHILD * cost_mult, org.generation + 1)
                         org.pupils[child.id] = 5
-                        org.energy -= ENERGY_COST_PER_CHILD * 1.1
+                        org.energy -= ENERGY_COST_PER_CHILD * 1.1 * cost_mult
                         if org.generation + 1 > self.max_gen_ever:
                             self.max_gen_ever = org.generation + 1
                             self.events.append(
@@ -1087,6 +1125,8 @@ class World:
             dominant_glyph = GLYPH_SET[dominant_key[5] % len(GLYPH_SET)] if dominant_key else "?"
             shannon = -sum((c/n) * math.log(c/n) for c in genome_counts.values()) if genome_counts else 0.0
             avg_age = sum(o.age for o in self.organisms) / n
+            avg_carn_spd = sum(o.genome[0] for o in self.organisms if o.genome[8] == 1) / max(1, n_carn)
+            avg_herb_spd = sum(o.genome[0] for o in self.organisms if o.genome[8] == 0) / max(1, n_herb)
         else:
             avg_e = max_g = avg_spd = avg_agg = avg_met = avg_mut = avg_tmp = avg_diet = avg_tox = avg_fat = species = n = 0
             n_herb = n_carn = n_omni = 0
@@ -1095,6 +1135,7 @@ class World:
             dominant_glyph = "?"
             shannon = 0.0
             avg_age = 0.0
+            avg_carn_spd = avg_herb_spd = 0.0
 
         lines.append(
             f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  Age:{avg_age:.1f}  "
@@ -1106,6 +1147,11 @@ class World:
             f"Res:{len(self.resources):3d}  Inf:{len(self.diseased):2d}  "
             f"{'☀' if self.season == 'summer' else '\u2744'}{'S' if self.season == 'summer' else 'W'}  T:{self.tick}"
         )
+        if n_herb > 0 or n_carn > 0:
+            lines.append(
+                f"  \u2694 carns:{avg_carn_spd:.1f}  herbs:{avg_herb_spd:.1f}  "
+                f"gap:{avg_carn_spd - avg_herb_spd:+.1f}"
+            )
 
         # Population sparkline (compact)
         if self.pop_history:
