@@ -710,6 +710,17 @@ class World:
                 rtype = self.resources.pop(pos)
                 val = RESOURCE_TYPES[rtype]["value"]
                 org.energy += val
+            else:
+                for other in self.organisms:
+                    if other is org or other.energy <= 0:
+                        continue
+                    if other.x == org.x and other.y == org.y and other.energy < org.energy * 0.6:
+                        gain = other.energy * 0.4
+                        org.energy += gain
+                        other.energy -= gain
+                        if other.energy <= 0:
+                            other.cause_of_death = "predation"
+                        break
 
         elif action_id == Action.ATTACK:
             for other in self.organisms:
