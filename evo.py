@@ -308,10 +308,10 @@ class AudioMixer:
 
     async def _mix_loop(self):
         buf_size = 512
-        vol = SOUND_VOLUME * 0.15
         phases: Dict[tuple, float] = {}
 
         while self._running:
+            master = SOUND_VOLUME
             with self.lock:
                 orgs = dict(self.orgs)
                 amb = dict(self.ambient)
@@ -331,26 +331,26 @@ class AudioMixer:
                     spread = (oid % 100) / 100.0
                     l_gain = math.cos(spread * math.pi * 0.5)
                     r_gain = math.sin(spread * math.pi * 0.5)
-                    for bi, (f, bv) in enumerate([(fb, vb*0.5), (fm, vm_), (ft, vt_*0.7)]):
+                    for bi, (f, bv) in enumerate([(fb, vb), (fm, vm_), (ft, vt_)]):
                         if f < 1 or bv < 0.0001:
                             continue
                         pk = ('org', oid, bi)
                         p = phases.get(pk, 0.0)
                         p += 2 * math.pi * f / self.SR
                         phases[pk] = p
-                        s = math.sin(p) * bv * vol
+                        s = math.sin(p) * bv * master * 0.015
                         left += s * l_gain
                         right += s * r_gain
 
                 for key, (fb, vb, fm, vm_, ft, vt_, _ts) in amb.items():
-                    for bi, (f, bv) in enumerate([(fb, vb*0.5), (fm, vm_), (ft, vt_*0.7)]):
+                    for bi, (f, bv) in enumerate([(fb, vb), (fm, vm_), (ft, vt_)]):
                         if f < 1 or bv < 0.0001:
                             continue
                         pk = ('amb', key, bi)
                         p = phases.get(pk, 0.0)
                         p += 2 * math.pi * f / self.SR
                         phases[pk] = p
-                        s = math.sin(p) * bv * vol * 0.5
+                        s = math.sin(p) * bv * master * 0.02
                         left += s
                         right += s
 
@@ -364,7 +364,7 @@ class AudioMixer:
                     p += 2 * math.pi * f / self.SR
                     phases[pk] = p
                     env = remain / total_s
-                    s = math.sin(p) * sv * env * vol * 1.5
+                    s = math.sin(p) * sv * env * master * 0.04
                     left += s
                     right += s
                     stings[skey] = (f, sv, remain - 1, total_s)
@@ -742,9 +742,35 @@ class World:
                 nx, ny = _wx(org.x + dx), _wy(org.y + dy)
                 if not any(o.x == nx and o.y == ny for o in self.organisms):
                     neighbors.append((nx, ny))
-            if neighbors:
-                nx, ny = random.choice(neighbors)
-                child_g = org.generation + 1
+            if not neighbors:
+                return
+            nx, ny = random.choice(neighbors)
+            child_g = org.generation + 1
+
+            # Look for a mate on adjacent cells
+            mate = None
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                mx, my = _wx(org.x + dx), _wy(org.y + dy)
+                for o in self.organisms:
+                    if o is not org and o.x == mx and o.y == my and o.energy >= 2.0:
+                        mate = o
+                        break
+                if mate:
+                    break
+
+            if mate:
+                # Sexual reproduction — crossover genomes
+                child_vm = org.vm.crossover(mate.vm)
+                child_vm = child_vm.clone_mutated()
+                cost = ENERGY_COST_PER_CHILD * 0.7
+                org.energy -= cost
+                mate.energy -= cost * 0.5
+                child = self._spawn(nx, ny, child_vm.genome,
+                                    energy=(org.energy + mate.energy) * 0.15,
+                                    generation=child_g)
+                org.energy -= child.energy * 0.5
+            else:
+                # Asexual reproduction — clone with mutations
                 child_vm = org.vm.clone_mutated()
                 child = self._spawn(nx, ny, child_vm.genome,
                                     energy=org.energy * 0.4,
