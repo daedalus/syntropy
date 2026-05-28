@@ -64,6 +64,27 @@ class Op:
     DUP, JNE = 30, 31
     TOTAL = 32
 
+# Per-opcode instruction cost (budget consumed per execution)
+OP_COST = [
+    0.002,  # NOP
+    0.004,  # MOV
+    0.006, 0.006,  # ADD, SUB
+    0.012, 0.016,  # MUL, DIV
+    0.006,         # JMP
+    0.012, 0.012, 0.012,  # JZ, JG, JL
+    0.014, 0.014,  # SENSE, ACT
+    0.006, 0.006,  # PUSH, POP
+    0.014, 0.010,  # CALL, RET
+    0.002,         # HALT
+    0.016, 0.006,  # RAND, ENERGY
+    0.016, 0.008,  # MOD, CMP
+    0.008, 0.008, 0.008, 0.006,  # AND, OR, XOR, NOT
+    0.012,         # IND
+    0.010, 0.010,  # MIN, MAX
+    0.006, 0.006,  # ABS, NEG
+    0.008, 0.012,  # DUP, JNE
+]
+
 class Sensor:
     FOOD_X, FOOD_Y, FOOD_DIST = 0, 1, 2
     ORG_X, ORG_Y, ORG_DIST = 3, 4, 5
@@ -157,7 +178,6 @@ class GenomeVM:
 
         while self.running and used < budget and self.instr_count < 200:
             self.instr_count += 1
-            used += 0.008
 
             if self.pc < 0 or self.pc >= glen - 2:
                 break
@@ -167,6 +187,8 @@ class GenomeVM:
             self.pc += 3
             if self.pc >= glen:
                 self.pc = 0
+
+            used += OP_COST[op]
 
             ridx = a1 % NUM_REGS
             v = self._val(a2)
