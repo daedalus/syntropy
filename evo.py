@@ -95,17 +95,19 @@ class Sensor:
     ACT_EAT, ACT_ATTACK = 17, 18
     TRACE = 19
     TRACE_DX, TRACE_DY = 20, 21
+    SIGNAL = 22
 
 class Action:
     MOVE_N, MOVE_S, MOVE_E, MOVE_W = 0, 1, 2, 3
     MOVE_TOWARD_FOOD, MOVE_AWAY_ORG = 4, 5
     EAT, ATTACK, REPRODUCE = 6, 7, 8
     REST, SOUND = 9, 10
-    TOTAL = 11
+    EMIT = 11
+    TOTAL = 12
 
 NUM_REGS = 4
-NUM_SENSORS = 22
-NUM_ACTIONS = 11
+NUM_SENSORS = 23
+NUM_ACTIONS = 12
 
 
 
@@ -464,6 +466,7 @@ class Organism:
     vol_mid: float = 0.0
     vol_treble: float = 0.0
     action_counts: Dict[int, float] = field(default_factory=dict)
+    last_regs: List[float] = field(default_factory=lambda: [0.0] * NUM_REGS)
 
     @property
     def genome(self) -> list:
@@ -530,6 +533,7 @@ class World:
         self.nests: Dict[Tuple[int, int], int] = {}
         self.territory: Dict[Tuple[int, int], Dict[int, int]] = {}
         self.traces: Dict[Tuple[int, int], float] = {}
+        self.signal_buffers: Dict[Tuple[int, int], List[float]] = {}
         self.death_stats: Dict[str, int] = {
             "starvation": 0, "predation": 0, "fighting": 0,
             "old_age": 0, "disease": 0, "unknown": 0,
@@ -726,6 +730,9 @@ class World:
         else:
             senses[Sensor.TRACE_DX] = 0.0
             senses[Sensor.TRACE_DY] = 0.0
+        # Signal sensor — incoming EMIT data
+        sig = self.signal_buffers.get((org.x, org.y), 0.0)
+        senses[Sensor.SIGNAL] = min(1.0, sig / 10.0)
         return senses
 
     def apply_action(self, org: Organism, action_id: int, _arg: int):
@@ -864,6 +871,14 @@ class World:
                                org.freq_mid, org.vol_mid,
                                org.freq_treble, org.vol_treble)
 
+        elif action_id == Action.EMIT:
+            reg_idx = _arg % NUM_REGS
+            val = org.last_regs[reg_idx]
+            for dx in range(-2, 3):
+                for dy in range(-2, 3):
+                    tx, ty = _wx(org.x + dx), _wy(org.y + dy)
+                    self.signal_buffers[(tx, ty)] = self.signal_buffers.get((tx, ty), 0.0) + abs(val)
+
     async def step(self):
         self.tick += 1
         self.shift_timer -= 1
@@ -934,6 +949,7 @@ class World:
             senses = self.compute_senses(org)
             budget = min(org.energy * 0.4, 8.0)
             actions = org.vm.execute(budget, senses)
+            org.last_regs = org.vm.regs.copy()
             return (org, actions, senses)
 
         results = await asyncio.gather(*[_run_org(o) for o in self.organisms])
@@ -1198,6 +1214,14 @@ class World:
             if s > 0.01:
                 decayed[pos] = s
         self.traces = decayed
+
+        # Signal buffer decay
+        dec_sig = {}
+        for pos, val in self.signal_buffers.items():
+            v = val * 0.85
+            if v > 0.01:
+                dec_sig[pos] = v
+        self.signal_buffers = dec_sig
 
         # Corpse resources
         for o in dead_list:
