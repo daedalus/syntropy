@@ -14,7 +14,7 @@ import struct
 import math
 import threading
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Set
 
 random.seed()
@@ -117,6 +117,8 @@ class Organism:
     id: int
     fat: float = 0.0
     torpor: bool = False
+    memory: List[Tuple[int, int]] = field(default_factory=list)
+    pupils: Dict[int, int] = field(default_factory=dict)  # child_id → remaining care ticks
 
 
 class World:
@@ -145,6 +147,7 @@ class World:
         self.season_timer = random.randint(*SEASON_LENGTH)
         self.diseased: Set[int] = set()
         self.sonify_counter = 0
+        self.predator_memory: Dict[int, Set[int]] = {}  # predator_hue → set of toxic_hues
 
         for _ in range(INITIAL_RESOURCES):
             rtype = random.choices(RESOURCE_KEYS, weights=[t["weight"] for t in RESOURCE_TYPES.values()])[0]
@@ -298,20 +301,20 @@ class World:
 
     def _spawn(
         self, x: int, y: int, genome: list, energy: float = 3.0, generation: int = 0
-    ):
-        self.organisms.append(
-            Organism(
-                x=max(0, min(WIDTH - 1, x)),
-                y=max(0, min(HEIGHT - 1, y)),
-                genome=genome,
-                energy=energy,
-                age=0,
-                generation=generation,
-                id=self.next_id,
-            )
+    ) -> Organism:
+        org = Organism(
+            x=max(0, min(WIDTH - 1, x)),
+            y=max(0, min(HEIGHT - 1, y)),
+            genome=genome,
+            energy=energy,
+            age=0,
+            generation=generation,
+            id=self.next_id,
         )
+        self.organisms.append(org)
         self.all_genomes_seen.add(tuple(genome))
         self.next_id += 1
+        return org
 
     def _temperature_at(self, y: int) -> float:
         t = 1.0 - y / (HEIGHT - 1)
@@ -476,21 +479,48 @@ class World:
                     if (org.x, org.y) in self.resources:
                         break
             elif not torpid:
-                for _ in range(speed):
-                    org.x = max(
-                        0,
-                        min(
-                            WIDTH - 1,
-                            org.x + random.choice([-1, 0, 1]),
-                        ),
-                    )
-                    org.y = max(
-                        0,
-                        min(
-                            HEIGHT - 1,
-                            org.y + random.choice([-1, 0, 1]),
-                        ),
-                    )
+                # Memory recall: navigate toward remembered food spots
+                mem_target = None
+                if org.memory:
+                    # Filter out spots that already have an organism on them
+                    occupied = {(o.x, o.y) for o in self.organisms if o.id not in dead}
+                    valid = [m for m in org.memory if m not in occupied]
+                    if valid:
+                        best_d = speed + 1
+                        for m in valid:
+                            d = abs(m[0] - org.x) + abs(m[1] - org.y)
+                            if d < best_d:
+                                best_d = d
+                                mem_target = m
+                if mem_target:
+                    tx, ty = mem_target
+                    steps = min(speed, abs(tx - org.x) + abs(ty - org.y))
+                    for _ in range(steps):
+                        dx = 1 if tx > org.x else -1 if tx < org.x else 0
+                        dy = 1 if ty > org.y else -1 if ty < org.y else 0
+                        org.x = max(0, min(WIDTH - 1, org.x + dx))
+                        org.y = max(0, min(HEIGHT - 1, org.y + dy))
+                        if (org.x, org.y) in self.resources:
+                            break
+                else:
+                    for _ in range(speed):
+                        org.x = max(
+                            0,
+                            min(
+                                WIDTH - 1,
+                                org.x + random.choice([-1, 0, 1]),
+                            ),
+                        )
+                        org.y = max(
+                            0,
+                            min(
+                                HEIGHT - 1,
+                                org.y + random.choice([-1, 0, 1]),
+                            ),
+                        )
+                # Memory decay
+                if org.memory and random.random() < 0.02:
+                    org.memory.pop(random.randrange(len(org.memory)))
 
             # --- CONSUME RESOURCE ---
             pos = (org.x, org.y)
@@ -503,6 +533,11 @@ class World:
                 elif diet == 1 and rtype == "corpse":
                     met_bonus += 0.4
                 org.energy += base_val * met_bonus
+                # Spatial memory: remember good foraging spots
+                if rtype in ("food", "bounty"):
+                    org.memory.append(pos)
+                    if len(org.memory) > 3:
+                        org.memory.pop(0)
 
             # --- METABOLIC COST ---
             base_cost = SUMMER_BASE_COST if self.season == "summer" else WINTER_BASE_COST
@@ -575,6 +610,11 @@ class World:
                             if abs(herdmate.x - other.x) <= 2 and abs(herdmate.y - other.y) <= 2:
                                 herd_count += 1
                         herd_bonus = 1.0 + herd_count * 0.15
+                        # Predator learned avoidance of toxic hues
+                        predator_hue = org.genome[5]
+                        learned = self.predator_memory.get(predator_hue, set())
+                        if prey_hue in learned and random.random() < 0.4:
+                            break  # predator hesitates, doesn't attack
                         org_power = max(0.1, org.energy) * (a + 1) / 4 * atk_mult
                         other_power = max(0.1, other.energy) * (b + 1) / 4 * (1.0 + camo * 0.5) * herd_bonus
                         total = org_power + other_power
@@ -587,6 +627,11 @@ class World:
                             tox = other.genome[9]
                             if tox > 0:
                                 org.energy -= tox * 0.4
+                                # Predator learns to avoid this hue
+                                pred_hue = org.genome[5]
+                                if pred_hue not in self.predator_memory:
+                                    self.predator_memory[pred_hue] = set()
+                                self.predator_memory[pred_hue].add(other.genome[5])
                             dead.add(other.id)
                             break  # satiated for this tick
                         else:
@@ -608,6 +653,37 @@ class World:
                         if abs(sym_other.x - org.x) <= 1 and abs(sym_other.y - org.y) <= 1:
                             org.energy += 0.03
                             break
+
+            # --- KIN SELECTION (similar genomes share energy) ---
+            if not torpid and org.energy > 1.5:
+                for kin in self.organisms:
+                    if kin is org or kin.id in dead:
+                        continue
+                    if abs(kin.x - org.x) <= 1 and abs(kin.y - org.y) <= 1:
+                        ham = sum(1 for i in range(len(GENES)) if org.genome[i] != kin.genome[i])
+                        if ham <= 2 and kin.energy < org.energy - 0.5:
+                            give = min(0.1, org.energy - 0.5)
+                            org.energy -= give
+                            kin.energy += give
+                            break
+
+            # --- PARENTAL CARE (parent feeds nearby young children) ---
+            if org.pupils and org.energy > 1.0:
+                expired = []
+                for cid, remaining in org.pupils.items():
+                    if remaining <= 0:
+                        expired.append(cid)
+                        continue
+                    for child in self.organisms:
+                        if child.id == cid and child.id not in dead:
+                            if abs(child.x - org.x) <= 2 and abs(child.y - org.y) <= 2:
+                                give = min(0.02, org.energy - 0.5)
+                                org.energy -= give
+                                child.energy += give
+                            break
+                    org.pupils[cid] = remaining - 1
+                for cid in expired:
+                    del org.pupils[cid]
 
             # --- DISEASE ---
             if org.id in self.diseased:
@@ -712,7 +788,10 @@ class World:
                         child_genome = self._mutate(child_genome, MUT_RATES[org.genome[6]])
                         child_gen = max(org.generation, mate.generation) + 1
                         energy_cost = ENERGY_COST_PER_CHILD * 0.7
-                        self._spawn(nx, ny, child_genome, energy_cost, child_gen)
+                        child = self._spawn(nx, ny, child_genome, energy_cost, child_gen)
+                        org.pupils[child.id] = 5
+                        if mate is not org:
+                            mate.pupils[child.id] = 5
                         org.energy -= energy_cost
                         mate.energy -= energy_cost
                         if child_gen > self.max_gen_ever:
@@ -722,10 +801,11 @@ class World:
                                 f"{GLYPH_SET[child_genome[5] % len(GLYPH_SET)]})"
                             )
                             self._sound("new_gen")
-                    elif org.energy >= REPRODUCTION_THRESHOLD:
+                    elif org.energy >= repro_thresh:
                         # ASEXUAL: clone + mutate
                         child_genome = self._mutate(org.genome, MUT_RATES[org.genome[6]])
-                        self._spawn(nx, ny, child_genome, ENERGY_COST_PER_CHILD, org.generation + 1)
+                        child = self._spawn(nx, ny, child_genome, ENERGY_COST_PER_CHILD, org.generation + 1)
+                        org.pupils[child.id] = 5
                         org.energy -= ENERGY_COST_PER_CHILD * 1.1
                         if org.generation + 1 > self.max_gen_ever:
                             self.max_gen_ever = org.generation + 1
@@ -960,6 +1040,9 @@ class World:
                     grid[org.y][org.x] = f"{DIM}\033[44m{color}{glyph}{RESET}"
                 elif org.fat > 1.5:
                     grid[org.y][org.x] = f"{BOLD}\033[43m{color}{glyph}{RESET}"
+                elif org.genome[9] >= 2:
+                    # Warning coloration: bright white on purple for highly toxic
+                    grid[org.y][org.x] = f"{BOLD}\033[45m\033[97m{glyph}{RESET}"
                 elif org.genome[9] > 0:
                     grid[org.y][org.x] = f"{BOLD}\033[45m{color}{glyph}{RESET}"
                 elif org.energy > 7:
