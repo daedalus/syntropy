@@ -31,8 +31,9 @@ TICK_RATE = 0.06
 
 # Two resource types: common food, rare bounty
 RESOURCE_TYPES = {
-    "food":  {"value": 1.5, "symbol": "·", "weight": 0.75},
-    "bounty":{"value": 5.5, "symbol": "★", "weight": 0.25},
+    "food":  {"value": 1.5, "symbol": "·", "weight": 0.65},
+    "bounty":{"value": 5.5, "symbol": "★", "weight": 0.20},
+    "corpse":{"value": 2.0, "symbol": "✿", "weight": 0.15},
 }
 RESOURCE_KEYS = list(RESOURCE_TYPES.keys())
 
@@ -322,11 +323,24 @@ class World:
                                 f"({GLYPH_SET[child_genome[5] % len(GLYPH_SET)]})"
                             )
 
-        # Remove dead
+        # Remove dead — but leave corpse resources
         pop_before = len(self.organisms)
-        self.organisms = [o for o in self.organisms if o.id not in dead]
+        dead_list = []
+        kept = []
+        for o in self.organisms:
+            if o.id in dead:
+                dead_list.append(o)
+            else:
+                kept.append(o)
+        self.organisms = kept
         pop_after = len(self.organisms)
         died = pop_before - pop_after
+        for o in dead_list:
+            if random.random() < 0.5 and (o.x, o.y) not in self.resources:
+                bounty_val = min(2.5, 0.3 + o.energy * 0.3)
+                # corpseless corpses become food; energy-rich corpses become bounty-ish
+                rtype = "corpse" if o.energy > 1.0 else "food"
+                self._add_resource(o.x, o.y, rtype)
 
         # Track max age
         for o in self.organisms:
@@ -540,6 +554,15 @@ class World:
                 f"({dominant_pct:.0f}% of pop)"
             )
 
+        # Sentinel genome (most-evolved organism)
+        if sentinel and sentinel.generation > 0:
+            g = sentinel.genome
+            lines.append(
+                f"  {BOLD}\033[47m\033[30m{GLYPH_SET[g[5] % len(GLYPH_SET)]}"
+                f"\033[0m sentinel: [{g[0]} {g[1]} {g[2]} {g[3]} {g[4]} {g[5]} {g[6]}]"
+                f"  gen={sentinel.generation}  age={sentinel.age}  ⚡={sentinel.energy:.1f}"
+            )
+
         # Events (last 3)
         self.events = self.events[-3:]
         for ev in self.events:
@@ -548,7 +571,7 @@ class World:
             "  " + "  ".join(
                 f"{COLORS[i]}{GLYPH_SET[i]}{RESET}={GENES[i][0]}"
                 for i in range(min(len(GENES), len(GLYPH_SET)))
-            ) + f"  {BOLD}★{RESET}=bounty"
+            ) + f"  {BOLD}★{RESET}=bounty  {BOLD}✿{RESET}=corpse"
         )
         return "\n".join(lines)
 
