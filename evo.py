@@ -41,6 +41,7 @@ SEXUAL_THRESHOLD = 3.0
 ENERGY_COST_PER_CHILD = 2.5
 BASE_MUTATION_RATE = 0.10
 ENV_SHIFT_INTERVAL = (30, 60)
+DAY_LENGTH = 120
 MIGRATION_INTERVAL = (80, 150)
 MIGRATION_BATCH = (3, 8)
 TICK_RATE = 0.06
@@ -68,6 +69,11 @@ GENES = [
     ("diet", 0, 2),
     ("toxin", 0, 3),
     ("lumen", 0, 3),
+    ("signal", 0, 4),
+    ("shield", 0, 3),
+    ("stealth", 0, 3),
+    ("regrow", 0, 3),
+    ("immunity", 0, 3),
 ]
 
 GLYPH_SET = "●◆▲■★✦⬟⬢◈◎◉"
@@ -130,6 +136,17 @@ class Organism:
     cause_of_death: str = ""
 
 
+def _tdist(a: int, b: int, size: int) -> int:
+    """Toroidal Manhattan distance along one axis."""
+    d = abs(a - b)
+    return min(d, size - d)
+
+def _wx(x: int) -> int:
+    return x % WIDTH if WIDTH else 0
+
+def _wy(y: int) -> int:
+    return y % HEIGHT if HEIGHT else 0
+
 class World:
     def __init__(self):
         self.organisms: List[Organism] = []
@@ -152,6 +169,11 @@ class World:
         self.all_genomes_seen: Set[Tuple[int, ...]] = set()
         self.recorded_fossils: Set[Tuple[int, ...]] = set()
         self.fossil_count = 0
+        self.daylight_phase = 0.0
+        self.daylight = 1.0
+        self.moisture = 0.5
+        self.pressure = 0.7
+        self.temp_diurnal = 0.0
         self.season = "summer"
         self.season_timer = random.randint(*SEASON_LENGTH)
         self.diseased: Set[int] = set()
@@ -257,60 +279,66 @@ class World:
         if not SOUND_ENABLED:
             return
         n = len(self.organisms)
+        if n < 1:
+            return
         cap = WIDTH * HEIGHT
         pop_density = n / cap if cap else 0
-        if n > 0:
-            avg_gen = sum(o.generation for o in self.organisms) / n
-            gen_ratio = avg_gen / max(1, self.max_gen_ever)
-            n_c = sum(1 for o in self.organisms if o.genome[8] == 1)
-            n_h = sum(1 for o in self.organisms if o.genome[8] == 0)
-            pr_ratio = n_c / max(1, n_h)
-            gc = {}
-            for o in self.organisms:
-                k = tuple(o.genome)
-                gc[k] = gc.get(k, 0) + 1
-            shannon = -sum((c/n) * math.log(c/n) for c in gc.values()) if gc else 0.0
-        else:
-            gen_ratio = 0.0
-            pr_ratio = 0.0
-            shannon = 0.0
-        n_parasites = len(self.parasites)
-        para_ratio = n_parasites / max(1, n)
-        # Left channel: pop density (bass) + predator-prey ratio (mid)
-        l_freq = 80 + pop_density * 300
-        l_mid = 200 + pr_ratio * 200
-        # Right channel: gen ratio (mid) + Shannon diversity (treble)
-        r_freq = 120 + gen_ratio * 300
-        r_treb = 400 + shannon * 150
-        # Parasite density adds a very low undertone
-        para_sub = 40 + para_ratio * 60
+        avg_gen = sum(o.generation for o in self.organisms) / n
+        gen_ratio = avg_gen / max(1, self.max_gen_ever)
+        gc = {}
+        for o in self.organisms:
+            k = tuple(o.genome)
+            gc[k] = gc.get(k, 0) + 1
+        shannon = -sum((c/n) * math.log(c/n) for c in gc.values()) if gc else 0.0
+        central = 80 + pop_density * 300 + shannon * 30
+        central = max(80, min(400, central))
         threading.Thread(
-            target=World._play_multitrack,
-            args=(l_freq, l_mid, r_freq, r_treb, para_sub, 0.05, SOUND_VOLUME * 0.4),
+            target=self._render_per_organism_audio,
+            args=(central,),
             daemon=True
         ).start()
 
-    @staticmethod
-    def _play_multitrack(l1: float, l2: float, r1: float, r2: float, sub: float,
-                         duration: float, volume: float = 0.3):
+    def _render_per_organism_audio(self, central: float):
+        if len(self.organisms) > 150:
+            orgs = random.sample(self.organisms, 150)
+        else:
+            orgs = self.organisms
         sr = 22050
-        n = int(sr * duration)
+        duration = 0.05
+        n_samples = int(sr * duration)
+        WT_SIZE = 1024
+        wt = [math.sin(2 * math.pi * i / WT_SIZE) for i in range(WT_SIZE)]
+        left_buf = [0.0] * n_samples
+        right_buf = [0.0] * n_samples
+        vol = SOUND_VOLUME * 0.3 / max(1, len(orgs))
+        for org in orgs:
+            genome_hash = hash(tuple(org.genome))
+            offset = (genome_hash % 200 - 100) * 0.4
+            beat = max(0.3, min(12, org.genome[11] * 2.0))
+            l_freq = central + offset - beat / 2
+            r_freq = central + offset + beat / 2
+            l_phase = 0.0
+            r_phase = 0.0
+            l_inc = l_freq * WT_SIZE / sr
+            r_inc = r_freq * WT_SIZE / sr
+            for i in range(n_samples):
+                env = 1.0 - i / n_samples
+                li = int(l_phase) % WT_SIZE
+                ri = int(r_phase) % WT_SIZE
+                left_buf[i] += wt[li] * env * vol
+                right_buf[i] += wt[ri] * env * vol
+                l_phase += l_inc
+                r_phase += r_inc
+        peak = max(
+            max(abs(v) for v in left_buf),
+            max(abs(v) for v in right_buf),
+            1e-6,
+        )
+        scale = 16384 / peak
         data = bytearray()
-        for i in range(n):
-            t = i / sr
-            env = 1.0 - i / n
-            ls = int(volume * env * 16384 * (
-                0.5 * math.sin(2 * math.pi * l1 * t) +
-                0.3 * math.sin(2 * math.pi * l2 * t) +
-                0.2 * math.sin(2 * math.pi * sub * t)
-            ))
-            rs = int(volume * env * 16384 * (
-                0.5 * math.sin(2 * math.pi * r1 * t) +
-                0.3 * math.sin(2 * math.pi * r2 * t) +
-                0.2 * math.sin(2 * math.pi * sub * t)
-            ))
-            data.extend(struct.pack("<h", ls))
-            data.extend(struct.pack("<h", rs))
+        for i in range(n_samples):
+            data.extend(struct.pack("<h", int(left_buf[i] * scale)))
+            data.extend(struct.pack("<h", int(right_buf[i] * scale)))
         try:
             proc = subprocess.Popen(
                 ["aplay", "-q", "-f", "S16_LE", "-r", str(sr), "-c", "2"],
@@ -351,7 +379,7 @@ class World:
             "avg_wnd": round(avg_g[4], 2), "avg_hue": round(avg_g[5], 2),
             "avg_mut": round(avg_g[6], 2), "avg_tmp": round(avg_g[7], 2),
             "avg_diet": round(avg_g[8], 2), "avg_tox": round(avg_g[9], 2),
-            "avg_lumen": round(avg_g[10], 2) if len(avg_g) > 10 else 0.0,
+            "avg_lumen": round(avg_g[10], 2),
             "n_herb": n_herb, "n_carn": n_carn, "n_omni": n_omni,
             "min_pop": self.min_pop_ever, "max_age": self.max_age_ever,
             "species": sp, "fossils": self.fossil_count,
@@ -388,8 +416,8 @@ class World:
         self, x: int, y: int, genome: list, energy: float = 3.0, generation: int = 0
     ) -> Organism:
         org = Organism(
-            x=max(0, min(WIDTH - 1, x)),
-            y=max(0, min(HEIGHT - 1, y)),
+            x=_wx(x),
+            y=_wy(y),
             genome=genome,
             energy=energy,
             age=0,
@@ -407,15 +435,42 @@ class World:
             t = min(1.0, t + 0.25)
         else:
             t = max(0.0, t - 0.25)
-        return t
+        diurnal = math.cos(2 * math.pi * (self.daylight_phase - 0.25))
+        t += diurnal * 0.2
+        return max(0.0, min(1.0, t))
+
+    def _living_genepool(self) -> Dict[int, float]:
+        """Gene value frequencies in the current population."""
+        n = len(self.organisms)
+        if n == 0:
+            return {}
+        freq: Dict[int, float] = {}
+        for o in self.organisms:
+            for i, v in enumerate(o.genome):
+                key = i * 100 + v
+                freq[key] = freq.get(key, 0) + 1.0 / n
+        return freq
 
     def _mutate(self, genome: list, mut_rate: float = BASE_MUTATION_RATE) -> list:
         new = list(genome)
+        genepool = self._living_genepool()
         for i in range(len(new)):
             if random.random() < mut_rate:
                 g_min, g_max = GENES[i][1], GENES[i][2]
                 delta = random.choice([-1, 1])
-                new[i] = max(g_min, min(g_max, new[i] + delta))
+                candidate = new[i] + delta
+                n_unique = len(set(o.genome[i] for o in self.organisms))
+                if candidate < 0:
+                    candidate = 0
+                elif candidate < g_min and n_unique < 3 and random.random() < 0.2:
+                    pass
+                elif candidate < g_min:
+                    candidate = g_min
+                elif candidate > g_max and n_unique < 3 and random.random() < 0.2:
+                    pass
+                elif candidate > g_max:
+                    candidate = g_max
+                new[i] = candidate
         return new
 
     def _transpose(self, genome: list, rate: float) -> list:
@@ -436,7 +491,7 @@ class World:
         x, y = org.x, org.y
         for dx in range(-sense, sense + 1):
             for dy in range(-sense, sense + 1):
-                pos = (x + dx, y + dy)
+                pos = (_wx(x + dx), _wy(y + dy))
                 if pos in self.resources:
                     d = abs(dx) + abs(dy)
                     if d < best_d:
@@ -451,7 +506,7 @@ class World:
         for other in self.organisms:
             if other is org or other.id in dead:
                 continue
-            d = abs(other.x - org.x) + abs(other.y - org.y)
+            d = _tdist(other.x, org.x, WIDTH) + _tdist(other.y, org.y, HEIGHT)
             if d < best_d:
                 best_d = d
                 best = other
@@ -466,6 +521,21 @@ class World:
         if self.shift_timer <= 0:
             self._shift_environment()
             self.shift_timer = random.randint(*ENV_SHIFT_INTERVAL)
+
+        self.daylight_phase = ((self.tick % DAY_LENGTH) / DAY_LENGTH)
+        self.daylight = 0.5 + 0.5 * math.cos(2 * math.pi * self.daylight_phase)
+        diurnal_temp = math.cos(2 * math.pi * (self.daylight_phase - 0.25))
+        self.temp_diurnal = diurnal_temp
+        pressure_diurnal = math.cos(2 * math.pi * self.daylight_phase) * 0.08
+        self.pressure += random.uniform(-0.03, 0.03) + pressure_diurnal * 0.04
+        self.pressure += (0.5 - self.pressure) * 0.015
+        self.pressure = max(0.1, min(1.0, self.pressure))
+        if self.daylight < 0.3:
+            self.moisture = min(1.0, self.moisture + 0.006)
+        elif self.daylight > 0.6:
+            self.moisture = max(0.0, self.moisture - 0.003 * (1.0 + diurnal_temp * 0.5))
+        if self.pressure < 0.35 and self.daylight < 0.4:
+            self.moisture = min(1.0, self.moisture + 0.15)
 
         self.season_timer -= 1
         if self.season_timer <= 0:
@@ -487,7 +557,7 @@ class World:
         for (cx, cy), rtype in list(self.resources.items()):
             if rtype == "corpse":
                 for org in self.organisms:
-                    if org.id not in dead and abs(org.x - cx) + abs(org.y - cy) <= 1:
+                    if org.id not in dead and _tdist(org.x, cx, WIDTH) + _tdist(org.y, cy, HEIGHT) <= 1:
                         org.energy += 0.03
 
         random.shuffle(self.organisms)
@@ -532,6 +602,10 @@ class World:
                         org.awake = True
             asleep = not org.awake and not torpid
 
+            # --- REGROW (passive energy regen) ---
+            if not torpid and not asleep and org.genome[14] > 0:
+                org.energy += org.genome[14] * 0.015
+
             # --- PARASITE DRAIN: parasites leech energy from host ---
             if org.parasite and org.host_id is not None:
                 host = None
@@ -560,7 +634,7 @@ class World:
                 for host_candidate in self.organisms:
                     if host_candidate is org or host_candidate.id in dead or host_candidate.parasite:
                         continue
-                    if host_candidate.energy > 3.0 and abs(host_candidate.x - org.x) <= 1 and abs(host_candidate.y - org.y) <= 1:
+                    if host_candidate.energy > 3.0 and _tdist(host_candidate.x, org.x, WIDTH) <= 1 and _tdist(host_candidate.y, org.y, HEIGHT) <= 1:
                         org.parasite = True
                         org.host_id = host_candidate.id
                         self.parasites[org.id] = host_candidate.id
@@ -583,8 +657,8 @@ class World:
                     # Omnivore: chase closest of organism or resource
                     res_target = self._nearest_resource(org)
                     if prey and res_target:
-                        p_dist = abs(prey.x - org.x) + abs(prey.y - org.y)
-                        r_dist = abs(res_target[0] - org.x) + abs(res_target[1] - org.y)
+                        p_dist = _tdist(prey.x, org.x, WIDTH) + _tdist(prey.y, org.y, HEIGHT)
+                        r_dist = _tdist(res_target[0], org.x, WIDTH) + _tdist(res_target[1], org.y, HEIGHT)
                         target = (prey.x, prey.y) if p_dist <= r_dist else res_target
                     elif prey:
                         target = (prey.x, prey.y)
@@ -601,7 +675,7 @@ class World:
                 for other in self.organisms:
                     if other is org or other.id in dead or other.genome[8] < 1:
                         continue
-                    d = abs(other.x - org.x) + abs(other.y - org.y)
+                    d = _tdist(other.x, org.x, WIDTH) + _tdist(other.y, org.y, HEIGHT)
                     if d < min_d:
                         min_d = d
                         nearest_pred = other
@@ -611,29 +685,29 @@ class World:
                     for sentinel in self.organisms:
                         if sentinel is org or sentinel.id in dead or sentinel.genome[8] != 0:
                             continue
-                        if sentinel.genome[1] >= 3 and abs(sentinel.x - nearest_pred.x) <= 3 and abs(sentinel.y - nearest_pred.y) <= 3:
+                        if sentinel.genome[1] >= 3 and _tdist(sentinel.x, nearest_pred.x, WIDTH) <= 3 and _tdist(sentinel.y, nearest_pred.y, HEIGHT) <= 3:
                             flee_p = 0.9
                             break
                     if random.random() < flee_p:
                         fx = org.x + (org.x - nearest_pred.x)
                         fy = org.y + (org.y - nearest_pred.y)
-                        target = (max(0, min(WIDTH-1, fx)), max(0, min(HEIGHT-1, fy)))
+                        target = (_wx(fx), _wy(fy))
                     fx = org.x + (org.x - nearest_pred.x)
                     fy = org.y + (org.y - nearest_pred.y)
-                    target = (max(0, min(WIDTH-1, fx)), max(0, min(HEIGHT-1, fy)))
+                    target = (_wx(fx), _wy(fy))
                     org.energy -= 0.05
 
             if not torpid and target:
                 tx, ty = target
-                steps = min(speed, abs(tx - org.x) + abs(ty - org.y))
+                steps = min(speed, _tdist(tx, org.x, WIDTH) + _tdist(ty, org.y, HEIGHT))
                 for _ in range(steps):
                     dx = 1 if tx > org.x else -1 if tx < org.x else 0
                     dy = 1 if ty > org.y else -1 if ty < org.y else 0
                     if random.random() < 0.15 + wander * 0.12:
                         dx += random.choice([-1, 0, 1])
                         dy += random.choice([-1, 0, 1])
-                    org.x = max(0, min(WIDTH - 1, org.x + (dx if dx else 0)))
-                    org.y = max(0, min(HEIGHT - 1, org.y + (dy if dy else 0)))
+                    org.x = _wx(org.x + dx)
+                    org.y = _wy(org.y + dy)
                     if (org.x, org.y) in self.resources:
                         break
             elif not torpid:
@@ -646,36 +720,24 @@ class World:
                     if valid:
                         best_d = speed + 1
                         for m in valid:
-                            d = abs(m[0] - org.x) + abs(m[1] - org.y)
+                            d = _tdist(m[0], org.x, WIDTH) + _tdist(m[1], org.y, HEIGHT)
                             if d < best_d:
                                 best_d = d
                                 mem_target = m
                 if mem_target:
                     tx, ty = mem_target
-                    steps = min(speed, abs(tx - org.x) + abs(ty - org.y))
+                    steps = min(speed, _tdist(tx, org.x, WIDTH) + _tdist(ty, org.y, HEIGHT))
                     for _ in range(steps):
                         dx = 1 if tx > org.x else -1 if tx < org.x else 0
                         dy = 1 if ty > org.y else -1 if ty < org.y else 0
-                        org.x = max(0, min(WIDTH - 1, org.x + dx))
-                        org.y = max(0, min(HEIGHT - 1, org.y + dy))
+                        org.x = _wx(org.x + dx)
+                        org.y = _wy(org.y + dy)
                         if (org.x, org.y) in self.resources:
                             break
                 else:
                     for _ in range(speed):
-                        org.x = max(
-                            0,
-                            min(
-                                WIDTH - 1,
-                                org.x + random.choice([-1, 0, 1]),
-                            ),
-                        )
-                        org.y = max(
-                            0,
-                            min(
-                                HEIGHT - 1,
-                                org.y + random.choice([-1, 0, 1]),
-                            ),
-                        )
+                        org.x = _wx(org.x + random.choice([-1, 0, 1]))
+                        org.y = _wy(org.y + random.choice([-1, 0, 1]))
                 # Memory decay
                 if org.memory and random.random() < 0.02:
                     org.memory.pop(random.randrange(len(org.memory)))
@@ -689,7 +751,7 @@ class World:
                     migrate_dir = 1 if actual_temp > pref_temp else -1  # 1=move south, -1=move north
                     strength = mismatch * org.genome[4] * 0.3
                     if random.random() < strength:
-                        org.y = max(0, min(HEIGHT - 1, org.y + migrate_dir))
+                        org.y = _wy(org.y + migrate_dir)
 
             # --- FLOCKING: low-aggression organisms align with nearby similar hues ---
             if not torpid and not asleep and org.genome[2] <= 1 and org.genome[8] == 0:
@@ -699,7 +761,7 @@ class World:
                 for flockmate in self.organisms:
                     if flockmate is org or flockmate.id in dead:
                         continue
-                    if abs(flockmate.x - org.x) <= 3 and abs(flockmate.y - org.y) <= 3:
+                    if _tdist(flockmate.x, org.x, WIDTH) <= 3 and _tdist(flockmate.y, org.y, HEIGHT) <= 3:
                         hue_diff = abs(org.genome[5] - flockmate.genome[5])
                         if hue_diff <= 2:
                             avg_dx += flockmate.x - org.x
@@ -709,8 +771,8 @@ class World:
                     dx = int(avg_dx / count)
                     dy = int(avg_dy / count)
                     if dx or dy:
-                        org.x = max(0, min(WIDTH - 1, org.x + (1 if dx > 0 else -1 if dx < 0 else 0)))
-                        org.y = max(0, min(HEIGHT - 1, org.y + (1 if dy > 0 else -1 if dy < 0 else 0)))
+                        org.x = _wx(org.x + (1 if dx > 0 else -1 if dx < 0 else 0))
+                        org.y = _wy(org.y + (1 if dy > 0 else -1 if dy < 0 else 0))
 
             # --- TERRITORY MARKING: aggression marks position with scent ---
             if org.genome[2] > 0:
@@ -740,9 +802,8 @@ class World:
                     org.energy += 1.0
                     # Chance to spawn offspring parasite
                     if org.energy > 4.0 and random.random() < 0.3:
-                        neighbors = [(org.x+dx, org.y+dy) for dx,dy in [(0,1),(0,-1),(1,0),(-1,0)]
-                                     if 0 <= org.x+dx < WIDTH and 0 <= org.y+dy < HEIGHT
-                                     and not any(o.x == org.x+dx and o.y == org.y+dy for o in self.organisms if o.id not in dead)]
+                        neighbors = [(_wx(org.x+dx), _wy(org.y+dy)) for dx,dy in [(0,1),(0,-1),(1,0),(-1,0)]
+                                     if not any(o.x == _wx(org.x+dx) and o.y == _wy(org.y+dy) for o in self.organisms if o.id not in dead)]
                         if neighbors:
                             nx, ny = random.choice(neighbors)
                             child = self._spawn(nx, ny, self._mutate(org.genome, MUT_RATES[org.genome[6]]), 1.5, org.generation + 1)
@@ -776,7 +837,7 @@ class World:
                 for hgt_other in self.organisms:
                     if hgt_other is org or hgt_other.id in dead:
                         continue
-                    if abs(hgt_other.x - org.x) <= 1 and abs(hgt_other.y - org.y) <= 1:
+                    if _tdist(hgt_other.x, org.x, WIDTH) <= 1 and _tdist(hgt_other.y, org.y, HEIGHT) <= 1:
                         i = random.randrange(len(GENES))
                         org.genome[i], hgt_other.genome[i] = hgt_other.genome[i], org.genome[i]
                         break
@@ -841,18 +902,21 @@ class World:
                             org_power = max(0, org.energy) * (a + 1) / 4 * kin_mod
                             other_power = max(0, other.energy) * (b + 1) / 4 * kin_mod
                             total = org_power + other_power
+                            shield_def = 1.0 - other.genome[12] * 0.15
                             if total > 0 and random.random() < org_power / total:
                                 other.cause_of_death = "fighting"
-                                org.energy += other.energy * 0.25
+                                org.energy += other.energy * 0.25 * shield_def
                                 dead.add(other.id)
                             else:
                                 org.cause_of_death = "fighting"
-                                other.energy += org.energy * 0.25
+                                shield_atk = 1.0 - org.genome[12] * 0.15
+                                other.energy += org.energy * 0.25 * shield_atk
                                 dead.add(org.id)
                                 break
                         elif a > 0 and random.random() < a / 3 * kin_mod:
                             other.cause_of_death = "fighting"
-                            org.energy += other.energy * 0.2
+                            shield_def = 1.0 - other.genome[12] * 0.15
+                            org.energy += other.energy * 0.2 * shield_def
                             dead.add(other.id)
 
             if org.id in dead:
@@ -863,7 +927,10 @@ class World:
                 for other in self.organisms:
                     if other is org or other.id in dead:
                         continue
-                    if abs(other.x - org.x) <= 1 and abs(other.y - org.y) <= 1:
+                    stealth = other.genome[13]
+                    if random.random() < stealth * 0.12:
+                        continue
+                    if _tdist(other.x, org.x, WIDTH) <= 1 and _tdist(other.y, org.y, HEIGHT) <= 1:
                         a = org.genome[2]
                         b = other.genome[2]
                         # Pack hunting: nearby predators coordinate
@@ -871,7 +938,7 @@ class World:
                         for packmate in self.organisms:
                             if packmate is org or packmate.id in dead or packmate.genome[8] < 1:
                                 continue
-                            if abs(packmate.x - other.x) <= 2 and abs(packmate.y - other.y) <= 2:
+                            if _tdist(packmate.x, other.x, WIDTH) <= 2 and _tdist(packmate.y, other.y, HEIGHT) <= 2:
                                 pack_count += 1
                         pack_bonus = 1.0 + pack_count * 0.15
                         atk_mult = (1.5 if diet == 1 else 1.0) * pack_bonus
@@ -884,7 +951,7 @@ class World:
                         for herdmate in self.organisms:
                             if herdmate is other or herdmate.id in dead or herdmate.genome[8] >= 1:
                                 continue
-                            if abs(herdmate.x - other.x) <= 2 and abs(herdmate.y - other.y) <= 2:
+                            if _tdist(herdmate.x, other.x, WIDTH) <= 2 and _tdist(herdmate.y, other.y, HEIGHT) <= 2:
                                 herd_count += 1
                         herd_bonus = 1.0 + herd_count * 0.15
                         # Cannibalism: starving predators attack any organism including own species
@@ -908,7 +975,7 @@ class World:
                             for mim in self.organisms:
                                 if mim is other or mim.id in dead:
                                     continue
-                                if mim.genome[9] >= 2 and abs(mim.x - other.x) <= 5 and abs(mim.y - other.y) <= 5:
+                                if mim.genome[9] >= 2 and _tdist(mim.x, other.x, WIDTH) <= 5 and _tdist(mim.y, other.y, HEIGHT) <= 5:
                                     nearby_toxic_hues.add(mim.genome[5])
                             if nearby_toxic_hues and other.genome[5] in nearby_toxic_hues:
                                 mimic_bonus = 0.75  # predator confuses mimic with toxic model
@@ -958,7 +1025,7 @@ class World:
                     if sym_other is org or sym_other.id in dead:
                         continue
                     if (diet == 0 and sym_other.genome[8] == 1) or (diet == 1 and sym_other.genome[8] == 0):
-                        if abs(sym_other.x - org.x) <= 1 and abs(sym_other.y - org.y) <= 1:
+                        if _tdist(sym_other.x, org.x, WIDTH) <= 1 and _tdist(sym_other.y, org.y, HEIGHT) <= 1:
                             org.energy += 0.03
                             break
 
@@ -967,7 +1034,7 @@ class World:
                 for kin in self.organisms:
                     if kin is org or kin.id in dead:
                         continue
-                    if abs(kin.x - org.x) <= 1 and abs(kin.y - org.y) <= 1:
+                    if _tdist(kin.x, org.x, WIDTH) <= 1 and _tdist(kin.y, org.y, HEIGHT) <= 1:
                         ham = sum(1 for i in range(len(GENES)) if org.genome[i] != kin.genome[i])
                         if ham <= 2 and kin.energy < org.energy - 0.5:
                             give = min(0.1, org.energy - 0.5)
@@ -980,11 +1047,11 @@ class World:
                 for cheater in self.organisms:
                     if cheater is org or cheater.id in dead or cheater.genome[2] > org.genome[2]:
                         continue
-                    if abs(cheater.x - org.x) <= 2 and abs(cheater.y - org.y) <= 2:
+                    if _tdist(cheater.x, org.x, WIDTH) <= 2 and _tdist(cheater.y, org.y, HEIGHT) <= 2:
                         if cheater.energy > 3.0:
                             starving_nearby = any(
                                 o is not org and o.id not in dead and o.energy < 0.5
-                                and abs(o.x - cheater.x) <= 2 and abs(o.y - cheater.y) <= 2
+                                and _tdist(o.x, cheater.x, WIDTH) <= 2 and _tdist(o.y, cheater.y, HEIGHT) <= 2
                                 for o in self.organisms
                             )
                             if starving_nearby:
@@ -1004,7 +1071,7 @@ class World:
                         continue
                     for child in self.organisms:
                         if child.id == cid and child.id not in dead:
-                            if abs(child.x - org.x) <= 2 and abs(child.y - org.y) <= 2:
+                            if _tdist(child.x, org.x, WIDTH) <= 2 and _tdist(child.y, org.y, HEIGHT) <= 2:
                                 give = min(0.02, org.energy - 0.5)
                                 org.energy -= give
                                 child.energy += give
@@ -1019,7 +1086,7 @@ class World:
                 for other in self.organisms:
                     if other.id in dead or other.id in self.diseased or other.id in self.immune:
                         continue
-                    if abs(other.x - org.x) <= 2 and abs(other.y - org.y) <= 2:
+                    if _tdist(other.x, org.x, WIDTH) <= 2 and _tdist(other.y, org.y, HEIGHT) <= 2:
                         if random.random() < 0.20:
                             self.diseased.add(other.id)
 
@@ -1066,7 +1133,7 @@ class World:
             local_density = sum(
                 1 for o in self.organisms
                 if o is not org and o.id not in dead
-                and abs(o.x - org.x) + abs(o.y - org.y) <= 3
+                and _tdist(o.x, org.x, WIDTH) + _tdist(o.y, org.y, HEIGHT) <= 3
             )
             density_penalty = 1.0 + max(0, local_density - 3) * 0.15
 
@@ -1082,8 +1149,8 @@ class World:
                     and any(
                         o is not org and o.id not in dead
                         and o.energy >= sex_thresh
-                        and abs(o.x - org.x) <= 1 + o.genome[10]  # bioluminescence extends mate detection
-                        and abs(o.y - org.y) <= 1 + o.genome[10]
+                        and _tdist(o.x, org.x, WIDTH) <= 1 + o.genome[10]
+                        and _tdist(o.y, org.y, HEIGHT) <= 1 + o.genome[10]
                         for o in self.organisms
                     ))
             ):
@@ -1095,8 +1162,8 @@ class World:
                         if other is org or other.id in dead:
                             continue
                         if other.energy >= sex_thresh:
-                            dx = abs(other.x - org.x)
-                            dy = abs(other.y - org.y)
+                            dx = _tdist(other.x, org.x, WIDTH)
+                            dy = _tdist(other.y, org.y, HEIGHT)
                             max_range = 1 + max(org.genome[10], other.genome[10])
                             if dx <= max_range and dy <= max_range:
                                 mate = other
@@ -1105,14 +1172,13 @@ class World:
                 # Find adjacent empty cell
                 neighbors = []
                 for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
-                    nx, ny = org.x + dx, org.y + dy
-                    if 0 <= nx < WIDTH and 0 <= ny < HEIGHT:
-                        if not any(
-                            o.x == nx and o.y == ny
-                            for o in self.organisms
-                            if o.id not in dead
-                        ):
-                            neighbors.append((nx, ny))
+                    nx, ny = _wx(org.x + dx), _wy(org.y + dy)
+                    if not any(
+                        o.x == nx and o.y == ny
+                        for o in self.organisms
+                        if o.id not in dead
+                    ):
+                        neighbors.append((nx, ny))
                 if neighbors:
                     nx, ny = random.choice(neighbors)
                     if mate:
@@ -1204,7 +1270,7 @@ class World:
             for v in lost_vals:
                 self.events.append(
                     f"🧬 Extinct: {GENES[gene_idx][0]}={v} "
-                    f"(never again)"
+                    f"(lost from population)"
                 )
                 self._sound("gene_extinct")
 
@@ -1252,7 +1318,15 @@ class World:
                 g_min, g_max = GENES[i][1], GENES[i][2]
                 delta = random.choice([-1, 1])
                 old = org.genome[i]
-                org.genome[i] = max(g_min, min(g_max, org.genome[i] + delta))
+                n_unique = len(set(o.genome[i] for o in self.organisms))
+                candidate = org.genome[i] + delta
+                if candidate < 0:
+                    candidate = 0
+                elif candidate < g_min and n_unique >= 3:
+                    candidate = g_min
+                elif candidate > g_max and n_unique >= 3:
+                    candidate = g_max
+                org.genome[i] = candidate
                 if org.genome[i] != old:
                     n_mutated += 1
             if n_mutated > 0:
@@ -1361,8 +1435,8 @@ class World:
             cx = random.randint(6, WIDTH - 6)
             cy = random.randint(3, HEIGHT - 3)
             for _ in range(random.randint(5, 15)):
-                x = max(0, min(WIDTH - 1, cx + random.randint(-4, 4)))
-                y = max(0, min(HEIGHT - 1, cy + random.randint(-2, 2)))
+                x = _wx(cx + random.randint(-4, 4))
+                y = _wy(cy + random.randint(-2, 2))
                 if (x, y) not in self.resources:
                     rtype = random.choices(RESOURCE_KEYS, weights=[t["weight"] for t in RESOURCE_TYPES.values()])[0]
                     self._add_resource(x, y, rtype)
@@ -1375,36 +1449,32 @@ class World:
         grid = [[" " for _ in range(WIDTH)] for _ in range(HEIGHT)]
 
         for (x, y), rtype in self.resources.items():
-            if 0 <= x < WIDTH and 0 <= y < HEIGHT:
-                occupied = any(o.x == x and o.y == y for o in self.organisms)
-                if not occupied:
-                    grid[y][x] = RESOURCE_TYPES[rtype]["symbol"]
+            occupied = any(o.x == x and o.y == y for o in self.organisms)
+            if not occupied:
+                grid[y][x] = RESOURCE_TYPES[rtype]["symbol"]
 
         # Render nests under unoccupied cells
         for (x, y), strength in self.nests.items():
-            if 0 <= x < WIDTH and 0 <= y < HEIGHT:
-                occupied = any(o.x == x and o.y == y for o in self.organisms)
-                if not occupied and grid[y][x] == " ":
-                    nest_age = min(4, strength // 10)
-                    nest_sym = ["░", "▒", "▓", "█", "█"][nest_age]
-                    grid[y][x] = f"{DIM}\033[33m{nest_sym}{RESET}"
+            occupied = any(o.x == x and o.y == y for o in self.organisms)
+            if not occupied and grid[y][x] == " ":
+                nest_age = min(4, strength // 10)
+                nest_sym = ["░", "▒", "▓", "█", "█"][nest_age]
+                grid[y][x] = f"{DIM}\033[33m{nest_sym}{RESET}"
 
         # Render territory as subtle background on unoccupied cells
         TERR_COLORS = ["\033[41m", "\033[42m", "\033[44m", "\033[45m", "\033[46m"]
         for (x, y), hues in self.territory.items():
-            if 0 <= x < WIDTH and 0 <= y < HEIGHT:
-                occupied = any(o.x == x and o.y == y for o in self.organisms)
-                if not occupied and grid[y][x] == " ":
-                    dom_hue = max(hues, key=hues.get)
-                    tc = TERR_COLORS[dom_hue % len(TERR_COLORS)]
-                    grid[y][x] = f"{DIM}{tc} {RESET}"
+            occupied = any(o.x == x and o.y == y for o in self.organisms)
+            if not occupied and grid[y][x] == " ":
+                dom_hue = max(hues, key=hues.get)
+                tc = TERR_COLORS[dom_hue % len(TERR_COLORS)]
+                grid[y][x] = f"{DIM}{tc} {RESET}"
 
         # Find sentinel (most-evolved organism)
         sentinel = max(self.organisms, key=lambda o: o.generation) if self.organisms else None
         sentinel_id = sentinel.id if sentinel else -1
 
         for org in self.organisms:
-            if 0 <= org.x < WIDTH and 0 <= org.y < HEIGHT:
                 diet = org.genome[8]
                 if diet == 1:
                     glyph = "⬢"
@@ -1548,12 +1618,17 @@ class World:
 
         # Gene frequency bars (compact histogram per gene)
         if self.organisms:
-            labels = ["spd", "sen", "agg", "met", "wnd", "hue", "mut", "tmp", "die", "tox"]
+            labels = ["spd", "sen", "agg", "met", "wnd", "hue", "mut", "tmp", "die", "tox", "lum", "sig", "shd", "stl", "rgw", "imm"]
             bar_parts = []
             for i, (label, (_, g_min, g_max)) in enumerate(zip(labels, GENES)):
-                counts = [0] * (g_max - g_min + 1)
-                for o in self.organisms:
-                    counts[o.genome[i]] += 1
+                span = g_max - g_min + 1
+                vals = [o.genome[i] for o in self.organisms]
+                lo, hi = min(vals), max(vals)
+                lo = min(lo, g_min)
+                hi = max(hi, g_max)
+                counts = [0] * (hi - lo + 1)
+                for v in vals:
+                    counts[v - lo] += 1
                 max_c = max(counts) if max(counts) > 0 else 1
                 bars = "".join(
                     " ▁▂▃▄▅▆▇█"[min(7, int(c / max_c * 7))]
@@ -1576,7 +1651,7 @@ class World:
             tag = " 🦠" if sentinel.id in self.diseased else ""
             lines.append(
                 f"  {BOLD}\033[47m\033[30m{GLYPH_SET[g[5] % len(GLYPH_SET)]}"
-                f"\033[0m {_species_name(tuple(g))}: [{g[0]} {g[1]} {g[2]} {g[3]} {g[4]} {g[5]} {g[6]} {g[7]} {g[8]} {g[9]} {g[10]}]"
+                f"\033[0m {_species_name(tuple(g))}: [{' '.join(str(v) for v in g)}]"
                 f"  gen={sentinel.generation}  age={sentinel.age}  ⚡={sentinel.energy:.1f}{tag}"
             )
 
@@ -1676,10 +1751,7 @@ def main():
                 print(f"\n  Extinction cause: Last {len(world.organisms)} organism(s)")
                 if world.organisms:
                     last = world.organisms[0]
-                    print(f"  Genome: [{last.genome[0]} {last.genome[1]} {last.genome[2]} "
-                          f"{last.genome[3]} {last.genome[4]} {last.genome[5]} "
-                          f"{last.genome[6]} {last.genome[7]} {last.genome[8]} {last.genome[9]} "
-                          f"{last.genome[10]}]")
+                    print(f"  Genome: [{' '.join(str(v) for v in last.genome)}]")
                     print(f"  Age: {last.age}  Energy: {last.energy:.1f}")
             print(f"{'═' * 40}")
             break
