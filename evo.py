@@ -25,6 +25,8 @@ REPRODUCTION_THRESHOLD = 5.0
 ENERGY_COST_PER_CHILD = 2.5
 MUTATION_RATE = 0.12
 ENV_SHIFT_INTERVAL = (30, 60)
+MIGRATION_INTERVAL = (80, 150)
+MIGRATION_BATCH = (3, 8)
 TICK_RATE = 0.06
 
 GENES = [
@@ -73,7 +75,9 @@ class World:
         self.max_gen_ever = 0
         self.max_age_ever = 0
         self.genes_found: List[Set[int]] = [set(range(g[1], g[2]+1)) for g in GENES]
-        self.genes_lost_last: List[int] = []
+        self.genes_lost: List[str] = []
+        self.migration_timer = random.randint(*MIGRATION_INTERVAL)
+        self.fossil_lineages: List[Tuple[int, ...]] = []
 
         for _ in range(INITIAL_RESOURCES):
             self._add_resource(
@@ -301,6 +305,20 @@ class World:
         if pre_pop < 10 and pop_after > pre_pop and pop_after >= 10:
             self.events.append(f"🌱 Population recovered to {pop_after}")
 
+        # --- MIGRATION (invasion from outside) ---
+        self.migration_timer -= 1
+        if self.migration_timer <= 0:
+            batch = random.randint(*MIGRATION_BATCH)
+            for _ in range(batch):
+                x = random.randint(0, WIDTH - 1)
+                y = random.randint(0, HEIGHT - 1)
+                genome = [random.randint(g[1], g[2]) for g in GENES]
+                self._spawn(x, y, genome, 4.0)
+            self.events.append(
+                f"🌊 {batch} invaders arrived from beyond"
+            )
+            self.migration_timer = random.randint(*MIGRATION_INTERVAL)
+
         # --- REGENERATE RESOURCES ---
         for _ in range(RESOURCE_REGEN):
             if len(self.resources) < WIDTH * HEIGHT * 0.25:
@@ -348,11 +366,18 @@ class World:
                 if not occupied:
                     grid[y][x] = "·"
 
+        # Find sentinel (most-evolved organism)
+        sentinel = max(self.organisms, key=lambda o: o.generation) if self.organisms else None
+        sentinel_id = sentinel.id if sentinel else -1
+
         for org in self.organisms:
             if 0 <= org.x < WIDTH and 0 <= org.y < HEIGHT:
                 glyph = GLYPH_SET[org.genome[5] % len(GLYPH_SET)]
                 color = COLORS[org.genome[5] % len(COLORS)]
-                if org.energy > 7:
+                if org.id == sentinel_id and org.generation > 0:
+                    # Sentinel: blinking/reverse effect with extra brightness
+                    grid[org.y][org.x] = f"{BOLD}\033[47m\033[30m{glyph}{RESET}"
+                elif org.energy > 7:
                     grid[org.y][org.x] = f"{BOLD}{color}{glyph}{RESET}"
                 elif org.energy > 3:
                     grid[org.y][org.x] = f"{color}{glyph}{RESET}"
@@ -438,10 +463,19 @@ def main():
             time.sleep(TICK_RATE)
             print("\033[H", end="")
     except KeyboardInterrupt:
-        print("\n\nExtinct. ✦")
-        if world.organisms:
-            print(f"Final pop: {len(world.organisms)}, "
-                  f"Generations: {max(o.generation for o in world.organisms)}")
+        total_extinct = sum(
+            len(set(range(g[1], g[2]+1)) - world.genes_found[i])
+            for i, g in enumerate(GENES)
+        )
+        print(f"\n\n{'═' * 40}")
+        print(f"  ✦  Evolution halted after {world.tick} ticks")
+        print(f"  Pop: {len(world.organisms)}  "
+              f"Generations: {world.max_gen_ever}  "
+              f"Max age: {world.max_age_ever}")
+        print(f"  Species now: {len({tuple(o.genome) for o in world.organisms})}")
+        if total_extinct:
+            print(f"  Gene values lost to extinction: {total_extinct}")
+        print(f"{'═' * 40}")
 
 
 if __name__ == "__main__":
