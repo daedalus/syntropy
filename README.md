@@ -46,16 +46,17 @@ Execution is async per organism per tick. Energy = gas (budget up to `min(energy
 | Reg | IND, GEN, PC, SETPC, TICK |
 | I/O | SENSE, ACT |
 | Energy | ENERGY |
+| Memory | MLOAD, MSTORE (16-slot persistent per-organism), GLOAD, GSTORE (64-slot shared world memory) |
 
-### Sensors (23)
+### Sensors (25)
 
 Position, resources (food distance/direction), temperature, pressure, moisture, daylight,
 organisms (density, distance, direction), population, predator/prey/kin proximity,
-disease, season, terrain, traces, signals.
+disease, season, terrain, traces, signals, symbol channel (symbol_id, symbol_val).
 
-### Actions (12)
+### Actions (13)
 
-Move N/S/E/W, toward food, away from organisms, EAT, ATTACK, REPRODUCE, REST, SOUND.
+Move N/S/E/W, toward food, away from organisms, EAT, ATTACK, REPRODUCE, REST, SOUND, EMIT, SYMEMIT.
 
 ### Weight system
 
@@ -74,7 +75,22 @@ providing automatic repair without explicit opcodes. Each bank mutates independe
 
 Organisms deposit pheromones (trace=0.5/tick, decay ×0.95) detectable via TRACE sensor (radius 3).
 EMIT action broadcasts a register value to nearby cells; SIGNAL sensor reads the buffer.
+SYMEMIT broadcasts a typed `(symbol_id, value)` pair; SYMBOL_ID and SYMBOL_VAL sensors read the
+dominant symbol at the organism's cell. Enables typed coordination and proto-language.
 Enables communication, coordination, and memory sharing.
+
+### Memory systems
+
+**Per-organism persistent memory** (16 float slots, opcodes MLOAD/MSTORE): survives across ticks
+for the lifetime of the organism. Allows learned state, counters, and context that persists.
+
+**World shared memory** (64 float slots, opcodes GLOAD/GSTORE): a single global blackboard all
+organisms can read and write. Decays slowly (×0.998/tick). Organisms that evolve to coordinate
+through specific slots gain collective knowledge that outlives any individual.
+
+**Cultural transmission**: on reproduction the parent's 16-slot memory is copied (with small
+Gaussian noise) into the child, creating a non-genetic inheritance channel that complements
+genome mutation. Learned behaviours can propagate across generations without being encoded in DNA.
 
 ### Per-organism audio
 

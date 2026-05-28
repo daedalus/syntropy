@@ -69,7 +69,9 @@ class Op:
     SQRT, EXP = 38, 39
     TICK, DROP, OVER = 40, 41, 42
     SHL, SHR, BIT = 43, 44, 45
-    TOTAL = 46
+    MLOAD, MSTORE = 46, 47   # per-organism persistent memory (16 slots)
+    GLOAD, GSTORE = 48, 49   # world shared memory (64 slots)
+    TOTAL = 50
 
 # Per-opcode instruction cost (budget consumed per execution)
 OP_COST = [
@@ -96,6 +98,8 @@ OP_COST = [
     0.014, 0.016,  # SQRT, EXP
     0.004, 0.004, 0.006,  # TICK, DROP, OVER
     0.008, 0.008, 0.006,  # SHL, SHR, BIT
+    0.008, 0.010,          # MLOAD, MSTORE
+    0.012, 0.016,          # GLOAD, GSTORE
 ]
 
 class Sensor:
@@ -109,6 +113,7 @@ class Sensor:
     TRACE = 19
     TRACE_DX, TRACE_DY = 20, 21
     SIGNAL = 22
+    SYMBOL_ID, SYMBOL_VAL = 23, 24   # typed symbol channel
 
 class Action:
     MOVE_N, MOVE_S, MOVE_E, MOVE_W = 0, 1, 2, 3
@@ -116,11 +121,12 @@ class Action:
     EAT, ATTACK, REPRODUCE = 6, 7, 8
     REST, SOUND = 9, 10
     EMIT = 11
-    TOTAL = 12
+    SYMEMIT = 12   # broadcast (symbol_id, value) pair to nearby cells
+    TOTAL = 13
 
 NUM_REGS = 4
-NUM_SENSORS = 23
-NUM_ACTIONS = 12
+NUM_SENSORS = 25
+NUM_ACTIONS = 13
 
 
 
@@ -153,6 +159,7 @@ class GenomeVM:
     stack: List[int] = field(default_factory=list)
     running: bool = True
     instr_count: int = 0
+    mem: List[float] = field(default_factory=lambda: [0.0] * 16)  # persistent across ticks
 
     def clone_mutated(self, rate: float = 0.06) -> 'GenomeVM':
         ng = list(self.genome)
@@ -181,7 +188,8 @@ class GenomeVM:
     def _val(self, v: int) -> float:
         return self._rg(v) if v < 64 else float(v) / 16.0
 
-    def execute(self, budget: float, senses: Dict[int, float], tick: int = 0) -> List[Tuple[int, int]]:
+    def execute(self, budget: float, senses: Dict[int, float], tick: int = 0,
+                shared_mem: Optional[List[float]] = None) -> List[Tuple[int, int]]:
         self.regs = [0.0] * NUM_REGS
         self.pc = 0
         self.stack = []
@@ -326,6 +334,16 @@ class GenomeVM:
                 self._sr(ridx, float(int(rv) >> (a2 % 16)))
             elif op == Op.BIT:
                 self._sr(a2 % NUM_REGS, 1.0 if (int(abs(rv)) >> (a1 & 7)) & 1 else 0.0)
+            elif op == Op.MLOAD:
+                self._sr(ridx, self.mem[a2 % 16])
+            elif op == Op.MSTORE:
+                self.mem[a2 % 16] = rv
+            elif op == Op.GLOAD:
+                if shared_mem is not None:
+                    self._sr(ridx, shared_mem[a2 % 64])
+            elif op == Op.GSTORE:
+                if shared_mem is not None:
+                    shared_mem[a2 % 64] = rv
 
         return actions
 
@@ -603,6 +621,8 @@ class World:
         self.territory: Dict[Tuple[int, int], Dict[int, int]] = {}
         self.traces: Dict[Tuple[int, int], float] = {}
         self.signal_buffers: Dict[Tuple[int, int], List[float]] = {}
+        self.shared_mem: List[float] = [0.0] * 64          # world-wide shared memory
+        self.symbol_buffers: Dict[Tuple[int, int], Dict[int, float]] = {}  # typed symbol channel
         self.death_stats: Dict[str, int] = {
             "starvation": 0, "predation": 0, "fighting": 0,
             "old_age": 0, "disease": 0, "unknown": 0,
@@ -694,7 +714,8 @@ class World:
 
     def _spawn(
         self, x: int, y: int, genome: list, energy: float = 3.0, generation: int = 0,
-        genome_b: Optional[List[int]] = None, active_bank: int = 0
+        genome_b: Optional[List[int]] = None, active_bank: int = 0,
+        parent_mem: Optional[List[float]] = None,
     ) -> Organism:
         ga = list(genome)
         gb = list(genome_b) if genome_b is not None else list(genome)
@@ -717,6 +738,9 @@ class World:
             vol_treble=0.0,
         )
         org.vm.genome = ga
+        if parent_mem is not None:
+            for i in range(min(len(parent_mem), 16)):
+                org.vm.mem[i] = parent_mem[i] + random.gauss(0, 0.05)
         self.organisms.append(org)
         self.all_genomes_seen.add(tuple(ga))
         return org
@@ -810,6 +834,15 @@ class World:
         # Signal sensor — incoming EMIT data
         sig = self.signal_buffers.get((org.x, org.y), 0.0)
         senses[Sensor.SIGNAL] = min(1.0, sig / 10.0)
+        # Symbol sensors — typed symbol channel (SYMEMIT)
+        sym_dict = self.symbol_buffers.get((org.x, org.y), {})
+        if sym_dict:
+            best_sym = max(sym_dict, key=lambda s: abs(sym_dict[s]))
+            senses[Sensor.SYMBOL_ID] = float(best_sym) / 63.0
+            senses[Sensor.SYMBOL_VAL] = max(-1.0, min(1.0, sym_dict[best_sym] / 10.0))
+        else:
+            senses[Sensor.SYMBOL_ID] = 0.0
+            senses[Sensor.SYMBOL_VAL] = 0.0
         return senses
 
     def apply_action(self, org: Organism, action_id: int, _arg: int, speed: int = 1):
@@ -933,7 +966,8 @@ class World:
                 self._spawn(nx, ny, child_ga,
                             genome_b=child_gb,
                             active_bank=random.randint(0, 1),
-                            energy=2.5, generation=child_g)
+                            energy=2.5, generation=child_g,
+                            parent_mem=org.vm.mem)
             else:
                 cost = ENERGY_COST_PER_CHILD * 0.6
                 org.energy -= cost
@@ -942,7 +976,8 @@ class World:
                 self._spawn(nx, ny, child_ga,
                             genome_b=child_gb,
                             active_bank=random.randint(0, 1),
-                            energy=2.0, generation=child_g)
+                            energy=2.0, generation=child_g,
+                            parent_mem=org.vm.mem)
                 if child_g > self.max_gen_ever:
                     self.max_gen_ever = child_g
                     self.events.append(f"Gen {child_g} reached!")
@@ -972,6 +1007,22 @@ class World:
                 for dy in range(-2, 3):
                     tx, ty = _wx(org.x + dx), _wy(org.y + dy)
                     self.signal_buffers[(tx, ty)] = self.signal_buffers.get((tx, ty), 0.0) + abs(val)
+
+        elif action_id == Action.SYMEMIT:
+            # upper 2 bits of _arg index the symbol-id register; lower 2 bits index the value register
+            sym_reg = (_arg >> 2) % NUM_REGS
+            val_reg = _arg % NUM_REGS
+            sym_id = int(abs(org.last_regs[sym_reg])) % 64
+            val = org.last_regs[val_reg]
+            for dx in range(-2, 3):
+                for dy in range(-2, 3):
+                    tx, ty = _wx(org.x + dx), _wy(org.y + dy)
+                    pos = (tx, ty)
+                    if pos not in self.symbol_buffers:
+                        self.symbol_buffers[pos] = {}
+                    self.symbol_buffers[pos][sym_id] = (
+                        self.symbol_buffers[pos].get(sym_id, 0.0) + val * 0.5
+                    )
 
     async def step(self):
         self.tick += 1
@@ -1043,7 +1094,7 @@ class World:
             org.vm.genome = org.genome_a if org.active_bank == 0 else org.genome_b
             senses = self.compute_senses(org)
             budget = min(org.energy * 0.4, 8.0)
-            actions = org.vm.execute(budget, senses, tick=self.tick)
+            actions = org.vm.execute(budget, senses, tick=self.tick, shared_mem=self.shared_mem)
             org.last_regs = org.vm.regs.copy()
             org.vm.genome = org.genome_a
             return (org, actions, senses)
@@ -1350,6 +1401,18 @@ class World:
                 dec_sig[pos] = v
         self.signal_buffers = dec_sig
 
+        # Symbol buffer decay
+        dec_sym: Dict[Tuple[int, int], Dict[int, float]] = {}
+        for pos, sym_dict in self.symbol_buffers.items():
+            new_d = {s: v * 0.85 for s, v in sym_dict.items() if abs(v * 0.85) > 0.01}
+            if new_d:
+                dec_sym[pos] = new_d
+        self.symbol_buffers = dec_sym
+
+        # Shared memory slow decay (values persist unless overwritten or allowed to fade)
+        for i in range(len(self.shared_mem)):
+            self.shared_mem[i] *= 0.998
+
         # Corpse resources
         for o in dead_list:
             self.mixer.remove_org(o.id)
@@ -1564,6 +1627,7 @@ class World:
                 f"Gen:{max_g:3d}  Age:{avg_age:.1f}  "
                 f"Sp:{sp:2d}  H\u2019:{shannon:.2f}  Fos:{self.fossil_count:4d}  "
                 f"Res:{len(self.resources):3d}  "
+                f"Shm:{sum(1 for v in self.shared_mem if abs(v) > 0.01):2d}  "
                 f"{'☀ sum' if self.season == 'summer' else '\u2744 win'}  "
                 f"T:{self.tick}  tot:{sum(o.energy+o.fat for o in self.organisms):.0f}/{MAX_SYSTEM_ENERGY:.0f}"
             )
@@ -1621,7 +1685,7 @@ class World:
                             "SENSE","ACT","PUSH","POP","CALL","RET","HALT","RAND","ENERGY",
                             "MOD","CMP","AND","OR","XOR","NOT","IND","MIN","MAX","ABS","NEG","DUP","JNE",
                             "SWAP","GEN","PICK","DPTH","PC","SETPC","SQRT","EXP","TICK","DROP","OVER",
-                            "SHL","SHR","BIT"]
+                            "SHL","SHR","BIT","MLOD","MSTR","GLOD","GSTR"]
                 g = sentinel.genome
                 decoded = []
                 for i in range(0, min(len(g), 54), 3):
@@ -1737,7 +1801,7 @@ async def main():
                             "SENSE","ACT","PUSH","POP","CALL","RET","HALT","RAND","ENERGY",
                             "MOD","CMP","AND","OR","XOR","NOT","IND","MIN","MAX","ABS","NEG","DUP","JNE",
                             "SWAP","GEN","PICK","DPTH","PC","SETPC","SQRT","EXP","TICK","DROP","OVER",
-                            "SHL","SHR","BIT"]
+                            "SHL","SHR","BIT","MLOD","MSTR","GLOD","GSTR"]
                 g = best.genome
                 decoded = []
                 for i in range(0, min(len(g), 54), 3):
