@@ -194,10 +194,12 @@ class GenomeVM:
                     self.pc = (a2 % max(3, glen)) // 3 * 3
             elif op == Op.SENSE:
                 sid = a1 % NUM_SENSORS
+                used += (a1 / 256.0) * 0.004
                 self._sr(a2 % NUM_REGS, senses.get(sid, 0.0))
             elif op == Op.ACT:
                 act_id = a1 % Action.TOTAL
-                actions.append((act_id, a2))
+                used += (a1 / 256.0) * 0.004
+                actions.append((act_id, a2, a1 / 256.0))
             elif op == Op.PUSH:
                 self.stack.append(int(rv))
             elif op == Op.POP:
@@ -940,7 +942,7 @@ class World:
 
             # Apply VM actions
             if not torpid and not asleep:
-                for act_id, arg in actions:
+                for act_id, arg, _intensity in actions:
                     self.apply_action(org, act_id, arg)
 
             # Decay and update action counts for trait evaluation
@@ -951,7 +953,7 @@ class World:
                     decayed[aid] = c2
             org.action_counts = decayed
             if not torpid and not asleep:
-                for act_id, _ in actions:
+                for act_id, *__ in actions:
                     org.action_counts[act_id] = org.action_counts.get(act_id, 0) + 1.0
 
             # Genome-determined drift when VM produces no movement actions
@@ -1109,7 +1111,7 @@ class World:
             if is_elder:
                 repro_thresh *= 0.8
             if org.energy >= repro_thresh:
-                vm_repro = any(act_id == Action.REPRODUCE for act_id, _ in actions)
+                vm_repro = any(act_id == Action.REPRODUCE for act_id, *__ in actions)
                 # Weak auto-reproduce fallback when far above threshold
                 if not vm_repro and org.energy >= repro_thresh * 2.0 and random.random() < 0.10:
                     self.apply_action(org, Action.REPRODUCE, 0)
