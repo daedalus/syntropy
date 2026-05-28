@@ -680,12 +680,16 @@ class World:
     def apply_action(self, org: Organism, action_id: int, _arg: int):
         if action_id == Action.MOVE_N:
             org.y = _wy(org.y - 1)
+            org.energy -= 0.02
         elif action_id == Action.MOVE_S:
             org.y = _wy(org.y + 1)
+            org.energy -= 0.02
         elif action_id == Action.MOVE_E:
             org.x = _wx(org.x + 1)
+            org.energy -= 0.02
         elif action_id == Action.MOVE_W:
             org.x = _wx(org.x - 1)
+            org.energy -= 0.02
 
         elif action_id == Action.MOVE_TOWARD_FOOD:
             best = None
@@ -701,6 +705,8 @@ class World:
                 dy = 1 if fy > org.y else -1 if fy < org.y else 0
                 org.x = _wx(org.x + dx)
                 org.y = _wy(org.y + dy)
+                if dx or dy:
+                    org.energy -= 0.02
 
         elif action_id == Action.MOVE_AWAY_ORG:
             for other in self.organisms:
@@ -712,6 +718,7 @@ class World:
                     fy = org.y + (org.y - other.y)
                     org.x = _wx(fx)
                     org.y = _wy(fy)
+                    org.energy -= 0.02
                     break
 
         elif action_id == Action.EAT:
@@ -788,7 +795,7 @@ class World:
                     self._sound("new_gen")
 
         elif action_id == Action.REST:
-            org.energy += 0.1
+            org.energy += 0.3
 
         elif action_id == Action.SOUND:
             vol = min(1.0, max(0.0, org.energy / 10.0))
