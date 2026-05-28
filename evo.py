@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""evo - A self-evolving ecosystem in your terminal.
+"""evo - VM-genome evolutionary ecosystem.
 
-Organisms with tiny genomes navigate a shifting 2D world, consuming resources,
-reproducing with mutation, and adapting as niches open and collapse.
-
-No stable equilibrium. Ever-evolving.
+Each organism carries a Turing-complete VM as its genome.
+Energy = gas. Traits emerge from VM programs, not hardcoded genes.
+Async organisms, per-organism audio channels, day/night toroidal world.
 """
 
+import asyncio
 import argparse
 import random
 import time
@@ -15,80 +15,79 @@ import math
 import json
 import threading
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Set
 
-
 SEED = 42
-
 EXTINCTION_LOG_FILE = "extinction.json"
 SOUND_ENABLED = True
 SOUND_VOLUME = 0.3
 
-# --- CONFIG ---
-WIDTH = 64
+WIDTH = 72
 HEIGHT = 26
 INITIAL_ORGANISMS = 40
-INITIAL_RESOURCES = 80
-RESOURCE_REGEN = 4
+INITIAL_RESOURCES = 100
+RESOURCE_REGEN = 5
 SEASON_LENGTH = (70, 110)
 SUMMER_REGEN = 6
 WINTER_REGEN = 2
 SUMMER_BASE_COST = 0.03
 WINTER_BASE_COST = 0.08
 REPRODUCTION_THRESHOLD = 5.0
-SEXUAL_THRESHOLD = 3.0
 ENERGY_COST_PER_CHILD = 2.5
-BASE_MUTATION_RATE = 0.10
 ENV_SHIFT_INTERVAL = (30, 60)
 DAY_LENGTH = 120
 MIGRATION_INTERVAL = (80, 150)
 MIGRATION_BATCH = (3, 8)
 TICK_RATE = 0.06
 
-# Two resource types: common food, rare bounty
 RESOURCE_TYPES = {
     "food":  {"value": 1.5, "symbol": "·", "weight": 0.65},
-    "bounty":{"value": 5.5, "symbol": "★", "weight": 0.20},
-    "corpse":{"value": 2.0, "symbol": "✿", "weight": 0.15},
+    "bounty": {"value": 5.5, "symbol": "★", "weight": 0.20},
+    "corpse": {"value": 2.0, "symbol": "✿", "weight": 0.15},
 }
 RESOURCE_KEYS = list(RESOURCE_TYPES.keys())
 
-# Mutation rate per gene value (0=low mut, 5=high mut)
-MUT_RATES = [0.08, 0.12, 0.16, 0.20, 0.24, 0.30]
+# VM opcodes
+class Op:
+    NOP, MOV, ADD, SUB, MUL, DIV = range(6)
+    JMP, JZ, JG, JL = range(6, 10)
+    SENSE, ACT = 10, 11
+    PUSH, POP, CALL, RET = 12, 13, 14, 15
+    HALT, RAND, ENERGY = 16, 17, 18
+    MOD, CMP = 19, 20
+    AND, OR, XOR, NOT = 21, 22, 23, 24
+    IND = 25
+    TOTAL = 26
 
-GENES = [
-    ("speed", 0, 3),
-    ("sense", 0, 4),
-    ("aggression", 0, 3),
-    ("metabolic", 0, 3),
-    ("wander", 0, 3),
-    ("hue", 0, 5),
-    ("mut_rate", 0, 5),
-    ("thermal", 0, 4),
-    ("diet", 0, 2),
-    ("toxin", 0, 3),
-    ("lumen", 0, 3),
-    ("signal", 0, 4),
-    ("shield", 0, 3),
-    ("stealth", 0, 3),
-    ("regrow", 0, 3),
-    ("immunity", 0, 3),
-]
+class Sensor:
+    FOOD_X, FOOD_Y, FOOD_DIST = 0, 1, 2
+    ORG_X, ORG_Y, ORG_DIST = 3, 4, 5
+    TEMP, DAYLIGHT, MOISTURE = 6, 7, 8
+    ENERGY, AGE, POP_DENSITY = 9, 10, 11
+    PRESSURE, SEASON, LATITUDE = 12, 13, 14
+    FAT, HEALTH = 15, 16
+    ACT_EAT, ACT_ATTACK = 17, 18
+
+class Action:
+    MOVE_N, MOVE_S, MOVE_E, MOVE_W = 0, 1, 2, 3
+    MOVE_TOWARD_FOOD, MOVE_AWAY_ORG = 4, 5
+    EAT, ATTACK, REPRODUCE = 6, 7, 8
+    REST, SOUND = 9, 10
+    TOTAL = 11
+
+NUM_REGS = 4
+NUM_SENSORS = 19
+NUM_ACTIONS = 11
+
+
 
 GLYPH_SET = "●◆▲■★✦⬟⬢◈◎◉"
 COLORS = [
-    "\033[31m",
-    "\033[33m",
-    "\033[32m",
-    "\033[36m",
-    "\033[34m",
-    "\033[35m",
-    "\033[91m",
-    "\033[95m",
-    "\033[92m",
-    "\033[93m",
-    "\033[94m",
+    "\033[31m", "\033[33m", "\033[32m", "\033[36m",
+    "\033[34m", "\033[35m", "\033[91m", "\033[95m",
+    "\033[92m", "\033[93m", "\033[94m",
 ]
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -104,13 +103,236 @@ SPECIES_ROOTS = [
 ]
 _name_cache: Dict[Tuple[int, ...], str] = {}
 
+
+@dataclass
+class GenomeVM:
+    genome: List[int]
+    regs: List[float] = field(default_factory=lambda: [0.0] * NUM_REGS)
+    pc: int = 0
+    stack: List[int] = field(default_factory=list)
+    running: bool = True
+    instr_count: int = 0
+
+    def clone_mutated(self, rate: float = 0.06) -> 'GenomeVM':
+        ng = list(self.genome)
+        for i in range(len(ng)):
+            if random.random() < rate:
+                ng[i] = max(0, min(255, ng[i] + random.choice([-2, -1, 1, 2])))
+        if random.random() < rate * 0.4 and len(ng) < 600:
+            idx = (random.randrange(0, len(ng) + 1) // 3) * 3
+            ng[idx:idx] = [random.randint(0, Op.TOTAL - 1),
+                           random.randint(0, 255), random.randint(0, 255)]
+        if random.random() < rate * 0.2 and len(ng) > 9:
+            idx = (random.randrange(0, len(ng)) // 3) * 3
+            ng = ng[:idx] + ng[idx + 3:]
+        return GenomeVM(genome=ng)
+
+    def crossover(self, other: 'GenomeVM') -> 'GenomeVM':
+        pt = (random.randrange(0, min(len(self.genome), len(other.genome)), 3))
+        return GenomeVM(genome=self.genome[:pt] + other.genome[pt:])
+
+    def _rg(self, v: int) -> float:
+        return self.regs[v % NUM_REGS]
+
+    def _sr(self, v: int, val: float):
+        self.regs[v % NUM_REGS] = val
+
+    def _val(self, v: int) -> float:
+        return self._rg(v) if v < 64 else float(v) / 16.0
+
+    def execute(self, budget: float, senses: Dict[int, float]) -> List[Tuple[int, int]]:
+        self.regs = [0.0] * NUM_REGS
+        self.pc = 0
+        self.stack = []
+        self.running = True
+        self.instr_count = 0
+        used = 0.0
+        actions = []
+        glen = len(self.genome)
+
+        while self.running and used < budget and self.instr_count < 200:
+            self.instr_count += 1
+            used += 0.008
+
+            if self.pc < 0 or self.pc >= glen - 2:
+                break
+            op = int(self.genome[self.pc]) % Op.TOTAL
+            a1 = int(self.genome[self.pc + 1]) % 256
+            a2 = int(self.genome[self.pc + 2]) % 256
+            self.pc += 3
+            if self.pc >= glen:
+                self.pc = 0
+
+            ridx = a1 % NUM_REGS
+            v = self._val(a2)
+            rv = self._rg(a1)
+
+            if op == Op.NOP:
+                pass
+            elif op == Op.MOV:
+                self._sr(ridx, v)
+            elif op == Op.ADD:
+                self._sr(ridx, rv + v)
+            elif op == Op.SUB:
+                self._sr(ridx, rv - v)
+            elif op == Op.MUL:
+                self._sr(ridx, rv * max(-50, min(50, v)))
+            elif op == Op.DIV:
+                if abs(v) > 0.001:
+                    self._sr(ridx, rv / v)
+            elif op == Op.JMP:
+                self.pc = (a1 % max(3, glen)) // 3 * 3
+            elif op == Op.JZ:
+                if abs(rv) < 0.001:
+                    self.pc = (a2 % max(3, glen)) // 3 * 3
+            elif op == Op.JG:
+                if rv > 0:
+                    self.pc = (a2 % max(3, glen)) // 3 * 3
+            elif op == Op.JL:
+                if rv < 0:
+                    self.pc = (a2 % max(3, glen)) // 3 * 3
+            elif op == Op.SENSE:
+                sid = a1 % NUM_SENSORS
+                self._sr(a2 % NUM_REGS, senses.get(sid, 0.0))
+            elif op == Op.ACT:
+                act_id = a1 % Action.TOTAL
+                actions.append((act_id, a2))
+            elif op == Op.PUSH:
+                self.stack.append(int(rv))
+            elif op == Op.POP:
+                if self.stack:
+                    self._sr(ridx, float(self.stack.pop()))
+            elif op == Op.CALL:
+                self.stack.append(self.pc)
+                self.pc = (a1 % max(3, glen)) // 3 * 3
+            elif op == Op.RET:
+                if self.stack:
+                    self.pc = self.stack.pop()
+                else:
+                    self.running = False
+            elif op == Op.HALT:
+                self.running = False
+            elif op == Op.RAND:
+                self._sr(ridx, random.random() * 10.0)
+            elif op == Op.ENERGY:
+                self._sr(ridx, budget - used)
+            elif op == Op.MOD:
+                if abs(v) > 0.001:
+                    self._sr(ridx, rv % v)
+            elif op == Op.CMP:
+                self._sr(ridx, 1.0 if rv > v else (-1.0 if rv < v else 0.0))
+            elif op == Op.AND:
+                self._sr(ridx, float(int(rv) & int(v)))
+            elif op == Op.OR:
+                self._sr(ridx, float(int(rv) | int(v)))
+            elif op == Op.XOR:
+                self._sr(ridx, float(int(rv) ^ int(v)))
+            elif op == Op.NOT:
+                self._sr(ridx, float(~int(rv)))
+            elif op == Op.IND:
+                self._sr(ridx, self._rg(int(v) % NUM_REGS))
+
+        return actions
+
+
+# Audio mixer — per-organism stereo audio in background thread
+class AudioMixer:
+    def __init__(self):
+        self.orgs: Dict[int, Tuple[float, float, float, float, float, float, float]] = {}
+        self.ambient: Dict[str, Tuple[float, float, float, float, float, float, float]] = {}
+        self.lock = threading.Lock()
+        self.running = True
+        self.thread = threading.Thread(target=self._mix_loop, daemon=True)
+        self.thread.start()
+
+    def set_org(self, oid: int, freq_bass: float, vol_bass: float,
+                freq_mid: float, vol_mid: float,
+                freq_treble: float, vol_treble: float):
+        with self.lock:
+            if vol_bass > 0.001 or vol_mid > 0.001 or vol_treble > 0.001:
+                self.orgs[oid] = (freq_bass, vol_bass, freq_mid, vol_mid,
+                                  freq_treble, vol_treble, time.time())
+            else:
+                self.orgs.pop(oid, None)
+
+    def set_ambient(self, key: str,
+                    freq_bass: float, vol_bass: float,
+                    freq_mid: float, vol_mid: float,
+                    freq_treble: float, vol_treble: float):
+        with self.lock:
+            if vol_bass > 0.0001 or vol_mid > 0.0001 or vol_treble > 0.0001:
+                self.ambient[key] = (freq_bass, vol_bass,
+                                     freq_mid, vol_mid,
+                                     freq_treble, vol_treble, time.time())
+            else:
+                self.ambient.pop(key, None)
+
+    def remove_org(self, oid: int):
+        with self.lock:
+            self.orgs.pop(oid, None)
+
+    def stop(self):
+        self.running = False
+
+    def _mix_loop(self):
+        sr = 22050
+        buf_size = 512
+        vol = SOUND_VOLUME * 0.15
+        while self.running:
+            with self.lock:
+                orgs = dict(self.orgs)
+                amb = dict(self.ambient)
+            n = len(orgs) + len(amb)
+            if n == 0:
+                time.sleep(0.05)
+                continue
+            data = bytearray()
+            for _ in range(buf_size):
+                t = time.time()
+                left = 0.0
+                right = 0.0
+                for oid, (fb, vb, fm, vm_, ft, vt_, _ts) in orgs.items():
+                    spread = (oid % 100) / 100.0
+                    l_gain = math.cos(spread * math.pi * 0.5)
+                    r_gain = math.sin(spread * math.pi * 0.5)
+                    pb = 2 * math.pi * fb * t
+                    pm = 2 * math.pi * fm * t
+                    pt = 2 * math.pi * ft * t
+                    s = (math.sin(pb) * vb * 0.5 +
+                         math.sin(pm) * vm_ +
+                         math.sin(pt) * vt_ * 0.7) * vol
+                    left += s * l_gain
+                    right += s * r_gain
+                for _key, (fb, vb, fm, vm_, ft, vt_, _ts) in amb.items():
+                    pb = 2 * math.pi * fb * t
+                    pm = 2 * math.pi * fm * t
+                    pt = 2 * math.pi * ft * t
+                    s = (math.sin(pb) * vb * 0.5 +
+                         math.sin(pm) * vm_ +
+                         math.sin(pt) * vt_ * 0.7) * vol
+                    left += s * 0.5
+                    right += s * 0.5
+                peak = max(abs(left), abs(right), 0.001)
+                scale = 16384 / peak
+                data.extend(struct.pack("<h", int(left * scale)))
+                data.extend(struct.pack("<h", int(right * scale)))
+            try:
+                proc = subprocess.Popen(
+                    ["aplay", "-q", "-f", "S16_LE", "-r", str(sr), "-c", "2"],
+                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+                )
+                proc.communicate(input=bytes(data), timeout=1)
+            except Exception:
+                pass
+
+
 def _species_name(genome: tuple) -> str:
     if genome in _name_cache:
         return _name_cache[genome]
     g = genome
-    idx1 = (g[0] * 7 + g[2] * 5 + g[4] * 3 + g[6]) % len(GENUS_ROOTS)
-    idx2 = (g[1] * 11 + g[3] * 7 + g[5] * 5 + g[7] * 3 + g[8] * 2 + g[9] * 2 + g[10] * 3) % len(SPECIES_ROOTS)
-    variant = (g[0] * 13 + g[3] * 17 + g[6] * 19 + g[10] * 23) % 100
+    idx1 = (g[0] * 7 + g[3] * 5 + g[6] * 3 + g[9]) % len(GENUS_ROOTS) if len(g) > 9 else hash(tuple(g[:6])) % len(GENUS_ROOTS)
+    idx2 = (g[1] * 11 + g[4] * 7 + g[7] * 5 + g[10] * 3 + g[12] * 2) % len(SPECIES_ROOTS) if len(g) > 12 else hash(tuple(g[3:6])) % len(SPECIES_ROOTS)
+    variant = (g[0] * 13 + g[3] * 17 + g[6] * 19 + g[9] * 23) % 100 if len(g) > 9 else hash(tuple(g[:3])) % 100
     name = f"{GENUS_ROOTS[idx1]} {SPECIES_ROOTS[idx2]} v.{variant}"
     _name_cache[genome] = name
     return name
@@ -120,32 +342,54 @@ def _species_name(genome: tuple) -> str:
 class Organism:
     x: int
     y: int
-    genome: list
+    vm: GenomeVM
     energy: float
     age: int
     generation: int
     id: int
     fat: float = 0.0
     torpor: bool = False
-    memory: List[Tuple[int, int]] = field(default_factory=list)
-    pupils: Dict[int, int] = field(default_factory=dict)
     awake: bool = True
     sleep_timer: int = 0
-    parasite: bool = False
-    host_id: Optional[int] = None
     cause_of_death: str = ""
+    freq_bass: float = 0.0
+    freq_mid: float = 0.0
+    freq_treble: float = 0.0
+    vol_bass: float = 0.0
+    vol_mid: float = 0.0
+    vol_treble: float = 0.0
+    action_counts: Dict[int, float] = field(default_factory=dict)
+
+    @property
+    def genome(self) -> list:
+        return self.vm.genome
 
 
 def _tdist(a: int, b: int, size: int) -> int:
-    """Toroidal Manhattan distance along one axis."""
     d = abs(a - b)
     return min(d, size - d)
+
 
 def _wx(x: int) -> int:
     return x % WIDTH if WIDTH else 0
 
+
 def _wy(y: int) -> int:
     return y % HEIGHT if HEIGHT else 0
+
+
+_next_id = 0
+
+
+def _next_oid() -> int:
+    global _next_id
+    _next_id += 1
+    return _next_id
+
+
+def random_genome(length: int = 30) -> List[int]:
+    return [random.randint(0, 255) for _ in range(length)]
+
 
 class World:
     def __init__(self):
@@ -162,8 +406,6 @@ class World:
         self.max_gen_ever = 0
         self.max_age_ever = 0
         self.min_pop_ever = INITIAL_ORGANISMS
-        self.genes_found: List[Set[int]] = [set(range(g[1], g[2]+1)) for g in GENES]
-        self.genes_lost: List[str] = []
         self.migration_timer = random.randint(*MIGRATION_INTERVAL)
         self.fossil_lineages: List[Tuple[int, ...]] = []
         self.all_genomes_seen: Set[Tuple[int, ...]] = set()
@@ -177,16 +419,15 @@ class World:
         self.season = "summer"
         self.season_timer = random.randint(*SEASON_LENGTH)
         self.diseased: Set[int] = set()
-        self.sonify_counter = 0
-        self.predator_memory: Dict[int, Set[int]] = {}  # predator_hue → set of toxic_hues
-        self.soil_fertility: Dict[Tuple[int, int], float] = {}  # grazed spots → fertility bonus
-        self.immune: Set[int] = set()  # organisms immune to disease
-        self.nests: Dict[Tuple[int, int], int] = {}  # position → strength (tick count)
-        self.territory: Dict[Tuple[int, int], Dict[int, int]] = {}  # pos → {hue: count}
-        self.parasites: Dict[int, int] = {}  # parasite_id → host_id
+        self.mixer = AudioMixer()
+        self.predator_memory: Dict[int, Set[int]] = {}
+        self.soil_fertility: Dict[Tuple[int, int], float] = {}
+        self.immune: Set[int] = set()
+        self.nests: Dict[Tuple[int, int], int] = {}
+        self.territory: Dict[Tuple[int, int], Dict[int, int]] = {}
         self.death_stats: Dict[str, int] = {
             "starvation": 0, "predation": 0, "fighting": 0,
-            "old_age": 0, "disease": 0, "parasitism": 0, "unknown": 0,
+            "old_age": 0, "disease": 0, "unknown": 0,
         }
         self.seed_used = SEED
 
@@ -200,16 +441,13 @@ class World:
             self._spawn(
                 random.randint(0, WIDTH - 1),
                 random.randint(0, HEIGHT - 1),
-                [random.randint(g[1], g[2]) for g in GENES],
+                random_genome(random.randint(18, 60)),
             )
 
     SOUND_TONES = {
         "mass_death":   (200, 0.15),
         "critical":     (100, 0.25),
         "bottleneck":   (150, 0.20),
-        "radiation":    (500, 0.10),
-        "disease":      (320, 0.12),
-        "epidemic":     (250, 0.20),
         "migration":    (600, 0.10),
         "fossil":       (700, 0.08),
         "season":       (400, 0.10),
@@ -217,18 +455,12 @@ class World:
         "env_shift":    (280, 0.15),
         "stress":       (180, 0.20),
         "new_gen":      (880, 0.06),
-        "gene_extinct": (130, 0.12),
-        "punish":       (550, 0.08),
-        "mimicry":      (660, 0.06),
-        "transposon":   (920, 0.05),
-        "territory":    (300, 0.10),
     }
 
     @staticmethod
     def _play_tone(freq: float, duration: float, volume: float = 0.3):
         sr = 22050
         n = int(sr * duration)
-        decay = 1.0
         data = bytearray()
         for i in range(n):
             t = i / sr
@@ -254,138 +486,30 @@ class World:
                 target=World._play_tone, args=(freq, dur, SOUND_VOLUME), daemon=True
             ).start()
 
-    @staticmethod
-    def _play_stereo(l_freq: float, r_freq: float, duration: float, volume: float = 0.3):
-        sr = 22050
-        n = int(sr * duration)
-        data = bytearray()
-        for i in range(n):
-            t = i / sr
-            env = 1.0 - i / n if duration > 0.05 else 1.0
-            ls = int(volume * env * 32767 * math.sin(2 * math.pi * l_freq * t))
-            rs = int(volume * env * 32767 * math.sin(2 * math.pi * r_freq * t))
-            data.extend(struct.pack("<h", ls))
-            data.extend(struct.pack("<h", rs))
-        try:
-            proc = subprocess.Popen(
-                ["aplay", "-q", "-f", "S16_LE", "-r", str(sr), "-c", "2"],
-                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
-            )
-            proc.communicate(input=bytes(data), timeout=1)
-        except Exception:
-            pass
-
-    def _sonify_tick(self):
-        if not SOUND_ENABLED:
-            return
-        n = len(self.organisms)
-        if n < 1:
-            return
-        cap = WIDTH * HEIGHT
-        pop_density = n / cap if cap else 0
-        avg_gen = sum(o.generation for o in self.organisms) / n
-        gen_ratio = avg_gen / max(1, self.max_gen_ever)
-        gc = {}
-        for o in self.organisms:
-            k = tuple(o.genome)
-            gc[k] = gc.get(k, 0) + 1
-        shannon = -sum((c/n) * math.log(c/n) for c in gc.values()) if gc else 0.0
-        central = 80 + pop_density * 300 + shannon * 30
-        central = max(80, min(400, central))
-        threading.Thread(
-            target=self._render_per_organism_audio,
-            args=(central,),
-            daemon=True
-        ).start()
-
-    def _render_per_organism_audio(self, central: float):
-        if len(self.organisms) > 150:
-            orgs = random.sample(self.organisms, 150)
-        else:
-            orgs = self.organisms
-        sr = 22050
-        duration = 0.05
-        n_samples = int(sr * duration)
-        WT_SIZE = 1024
-        wt = [math.sin(2 * math.pi * i / WT_SIZE) for i in range(WT_SIZE)]
-        left_buf = [0.0] * n_samples
-        right_buf = [0.0] * n_samples
-        vol = SOUND_VOLUME * 0.3 / max(1, len(orgs))
-        for org in orgs:
-            genome_hash = hash(tuple(org.genome))
-            offset = (genome_hash % 200 - 100) * 0.4
-            beat = max(0.3, min(12, org.genome[11] * 2.0))
-            l_freq = central + offset - beat / 2
-            r_freq = central + offset + beat / 2
-            l_phase = 0.0
-            r_phase = 0.0
-            l_inc = l_freq * WT_SIZE / sr
-            r_inc = r_freq * WT_SIZE / sr
-            for i in range(n_samples):
-                env = 1.0 - i / n_samples
-                li = int(l_phase) % WT_SIZE
-                ri = int(r_phase) % WT_SIZE
-                left_buf[i] += wt[li] * env * vol
-                right_buf[i] += wt[ri] * env * vol
-                l_phase += l_inc
-                r_phase += r_inc
-        peak = max(
-            max(abs(v) for v in left_buf),
-            max(abs(v) for v in right_buf),
-            1e-6,
-        )
-        scale = 16384 / peak
-        data = bytearray()
-        for i in range(n_samples):
-            data.extend(struct.pack("<h", int(left_buf[i] * scale)))
-            data.extend(struct.pack("<h", int(right_buf[i] * scale)))
-        try:
-            proc = subprocess.Popen(
-                ["aplay", "-q", "-f", "S16_LE", "-r", str(sr), "-c", "2"],
-                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
-            )
-            proc.communicate(input=bytes(data), timeout=1)
-        except Exception:
-            pass
-
     def _log_extinction(self, etype: str, pop: int):
         orgs = self.organisms
         n = len(orgs)
         if n > 0:
             avg_e = sum(o.energy for o in orgs) / n
             avg_f = sum(o.fat for o in orgs) / n
-            avg_g = [sum(o.genome[i] for o in orgs) / n for i in range(len(GENES))]
-            n_herb = sum(1 for o in orgs if o.genome[8] == 0)
-            n_carn = sum(1 for o in orgs if o.genome[8] == 1)
-            n_omni = sum(1 for o in orgs if o.genome[8] == 2)
             sp = len({tuple(o.genome) for o in orgs})
             gc: Dict[Tuple[int, ...], int] = {}
             for o in orgs:
                 k = tuple(o.genome)
                 gc[k] = gc.get(k, 0) + 1
             dom = max(gc, key=gc.get) if gc else ()
-            dom_g = " ".join(str(v) for v in dom)
+            dom_g = " ".join(str(v) for v in dom[:6])
         else:
-            avg_e = avg_f = n_herb = n_carn = n_omni = sp = 0
-            avg_g = [0.0] * len(GENES)
+            avg_e = avg_f = sp = 0
             dom_g = ""
         event = {
             "seed": self.seed_used, "ts": time.strftime("%Y%m%d_%H%M%S"),
             "tick": self.tick, "event": etype, "pop": pop,
             "max_gen": self.max_gen_ever, "season": self.season,
             "avg_energy": round(avg_e, 2), "avg_fat": round(avg_f, 3),
-            "avg_spd": round(avg_g[0], 2), "avg_sen": round(avg_g[1], 2),
-            "avg_agg": round(avg_g[2], 2), "avg_met": round(avg_g[3], 2),
-            "avg_wnd": round(avg_g[4], 2), "avg_hue": round(avg_g[5], 2),
-            "avg_mut": round(avg_g[6], 2), "avg_tmp": round(avg_g[7], 2),
-            "avg_diet": round(avg_g[8], 2), "avg_tox": round(avg_g[9], 2),
-            "avg_lumen": round(avg_g[10], 2),
-            "n_herb": n_herb, "n_carn": n_carn, "n_omni": n_omni,
-            "min_pop": self.min_pop_ever, "max_age": self.max_age_ever,
             "species": sp, "fossils": self.fossil_count,
             "diseased": len(self.diseased), "resources": len(self.resources),
-            "nests": len(self.nests), "sleeping": len([o for o in self.organisms if not o.awake]),
-            "territory": len(self.territory), "parasites": len(self.parasites),
+            "nests": len(self.nests), "territory": len(self.territory),
             "dominant_genome": dom_g,
         }
         line = json.dumps(event)
@@ -407,7 +531,6 @@ class World:
             with open(EXTINCTION_LOG_FILE, "r+b") as f:
                 f.seek(-1, 2)
                 f.write(b",\n" + line.encode() + b"\n]")
-    
 
     def _add_resource(self, x: int, y: int, rtype: str = "food"):
         self.resources[(x, y)] = rtype
@@ -416,103 +539,189 @@ class World:
         self, x: int, y: int, genome: list, energy: float = 3.0, generation: int = 0
     ) -> Organism:
         org = Organism(
-            x=_wx(x),
-            y=_wy(y),
-            genome=genome,
+            x=_wx(x), y=_wy(y),
+            vm=GenomeVM(genome=genome),
             energy=energy,
             age=0,
             generation=generation,
-            id=self.next_id,
+            id=_next_oid(),
+            freq_bass=random.uniform(30, 100),
+            freq_mid=random.uniform(150, 600),
+            freq_treble=random.uniform(700, 4000),
+            vol_bass=0.0,
+            vol_mid=0.0,
+            vol_treble=0.0,
         )
         self.organisms.append(org)
         self.all_genomes_seen.add(tuple(genome))
-        self.next_id += 1
         return org
 
     def _temperature_at(self, y: int) -> float:
-        t = 1.0 - y / (HEIGHT - 1)
+        lat = 1.0 - 2.0 * y / (HEIGHT - 1)
+        base = 1.0 - abs(lat)
         if self.season == "summer":
-            t = min(1.0, t + 0.25)
+            base = min(1.0, base + 0.15)
         else:
-            t = max(0.0, t - 0.25)
+            base = max(0.0, base - 0.15)
         diurnal = math.cos(2 * math.pi * (self.daylight_phase - 0.25))
-        t += diurnal * 0.2
-        return max(0.0, min(1.0, t))
+        return max(0.0, min(1.0, base + diurnal * 0.15))
 
-    def _living_genepool(self) -> Dict[int, float]:
-        """Gene value frequencies in the current population."""
-        n = len(self.organisms)
-        if n == 0:
-            return {}
-        freq: Dict[int, float] = {}
-        for o in self.organisms:
-            for i, v in enumerate(o.genome):
-                key = i * 100 + v
-                freq[key] = freq.get(key, 0) + 1.0 / n
-        return freq
+    def _daylight_at(self, x: int, phase: float) -> float:
+        terminator = phase * WIDTH
+        dist_to_term = ((x - terminator) % WIDTH)
+        if dist_to_term < WIDTH / 2:
+            return 0.5 + 0.5 * math.cos(2 * math.pi * dist_to_term / WIDTH)
+        else:
+            night_dist = dist_to_term - WIDTH / 2
+            return 0.5 - 0.5 * math.cos(2 * math.pi * night_dist / WIDTH)
 
-    def _mutate(self, genome: list, mut_rate: float = BASE_MUTATION_RATE) -> list:
-        new = list(genome)
-        genepool = self._living_genepool()
-        for i in range(len(new)):
-            if random.random() < mut_rate:
-                g_min, g_max = GENES[i][1], GENES[i][2]
-                delta = random.choice([-1, 1])
-                candidate = new[i] + delta
-                n_unique = len(set(o.genome[i] for o in self.organisms))
-                if candidate < 0:
-                    candidate = 0
-                elif candidate < g_min and n_unique < 3 and random.random() < 0.2:
-                    pass
-                elif candidate < g_min:
-                    candidate = g_min
-                elif candidate > g_max and n_unique < 3 and random.random() < 0.2:
-                    pass
-                elif candidate > g_max:
-                    candidate = g_max
-                new[i] = candidate
-        return new
+    def compute_senses(self, org: Organism) -> Dict[int, float]:
+        senses = {}
+        best_food = None
+        best_fd = 999
+        for (fx, fy) in self.resources:
+            d = _tdist(org.x, fx, WIDTH) + _tdist(org.y, fy, HEIGHT)
+            if d < best_fd:
+                best_fd = d
+                best_food = (fx, fy)
+        if best_food:
+            senses[Sensor.FOOD_X] = float(best_food[0])
+            senses[Sensor.FOOD_Y] = float(best_food[1])
+            senses[Sensor.FOOD_DIST] = float(best_fd)
+        else:
+            senses[Sensor.FOOD_DIST] = 99.0
 
-    def _transpose(self, genome: list, rate: float) -> list:
-        new = list(genome)
-        if random.random() < rate:
-            i = random.randrange(len(new))
-            j = random.randrange(len(new))
-            if i != j and random.random() < 0.5:
-                new[j] = new[i]
-            elif i != j:
-                new[i], new[j] = new[j], new[i]
-        return new
-
-    def _nearest_resource(self, org: Organism) -> Optional[Tuple[int, int]]:
-        sense = org.genome[1]
-        best_d = sense + 1
-        best = None
-        x, y = org.x, org.y
-        for dx in range(-sense, sense + 1):
-            for dy in range(-sense, sense + 1):
-                pos = (_wx(x + dx), _wy(y + dy))
-                if pos in self.resources:
-                    d = abs(dx) + abs(dy)
-                    if d < best_d:
-                        best_d = d
-                        best = pos
-        return best
-
-    def _nearest_organism(self, org: Organism, dead: Set[int]) -> Optional[Organism]:
-        sense = org.genome[1]
-        best_d = sense + 1
-        best = None
+        best_org = None
+        best_od = 999
         for other in self.organisms:
-            if other is org or other.id in dead:
+            if other is org or other.id in self._dead_this_tick:
                 continue
-            d = _tdist(other.x, org.x, WIDTH) + _tdist(other.y, org.y, HEIGHT)
-            if d < best_d:
-                best_d = d
-                best = other
-        return best
+            d = _tdist(org.x, other.x, WIDTH) + _tdist(org.y, other.y, HEIGHT)
+            if d < best_od:
+                best_od = d
+                best_org = other
+        if best_org:
+            senses[Sensor.ORG_X] = float(best_org.x)
+            senses[Sensor.ORG_Y] = float(best_org.y)
+            senses[Sensor.ORG_DIST] = float(best_od)
+        else:
+            senses[Sensor.ORG_DIST] = 99.0
 
-    def step(self):
+        phase = (self.tick % DAY_LENGTH) / DAY_LENGTH
+        daylight = self._daylight_at(org.x, phase)
+        senses[Sensor.DAYLIGHT] = daylight
+        senses[Sensor.TEMP] = self._temperature_at(org.y)
+        senses[Sensor.MOISTURE] = 0.3 + 0.7 * (1.0 - daylight)
+        senses[Sensor.ENERGY] = org.energy
+        senses[Sensor.AGE] = float(org.age)
+        senses[Sensor.POP_DENSITY] = len(self.organisms) / (WIDTH * HEIGHT)
+        senses[Sensor.PRESSURE] = self.pressure
+        senses[Sensor.SEASON] = 1.0 if self.season == "summer" else 0.0
+        senses[Sensor.LATITUDE] = 1.0 - 2.0 * org.y / (HEIGHT - 1)
+        senses[Sensor.FAT] = org.fat
+        senses[Sensor.HEALTH] = min(1.0, org.energy / 5.0)
+        senses[Sensor.ACT_EAT] = org.action_counts.get(Action.EAT, 0)
+        senses[Sensor.ACT_ATTACK] = org.action_counts.get(Action.ATTACK, 0)
+        return senses
+
+    def apply_action(self, org: Organism, action_id: int, _arg: int):
+        speed = 1 + (org.vm.instr_count // 10)
+
+        if action_id == Action.MOVE_N:
+            org.y = _wy(org.y - speed)
+        elif action_id == Action.MOVE_S:
+            org.y = _wy(org.y + speed)
+        elif action_id == Action.MOVE_E:
+            org.x = _wx(org.x + speed)
+        elif action_id == Action.MOVE_W:
+            org.x = _wx(org.x - speed)
+
+        elif action_id == Action.MOVE_TOWARD_FOOD:
+            best = None
+            best_d = 999
+            for (fx, fy) in self.resources:
+                d = _tdist(org.x, fx, WIDTH) + _tdist(org.y, fy, HEIGHT)
+                if d < best_d:
+                    best_d = d
+                    best = (fx, fy)
+            if best:
+                fx, fy = best
+                for _ in range(min(speed, best_d)):
+                    dx = 1 if fx > org.x else -1 if fx < org.x else 0
+                    dy = 1 if fy > org.y else -1 if fy < org.y else 0
+                    org.x = _wx(org.x + dx)
+                    org.y = _wy(org.y + dy)
+
+        elif action_id == Action.MOVE_AWAY_ORG:
+            for other in self.organisms:
+                if other is org:
+                    continue
+                d = _tdist(org.x, other.x, WIDTH) + _tdist(org.y, other.y, HEIGHT)
+                if d <= 3:
+                    fx = org.x + (org.x - other.x)
+                    fy = org.y + (org.y - other.y)
+                    org.x = _wx(fx)
+                    org.y = _wy(fy)
+                    break
+
+        elif action_id == Action.EAT:
+            pos = (org.x, org.y)
+            if pos in self.resources:
+                rtype = self.resources.pop(pos)
+                val = RESOURCE_TYPES[rtype]["value"]
+                org.energy += val
+
+        elif action_id == Action.ATTACK:
+            for other in self.organisms:
+                if other is org:
+                    continue
+                if other.x == org.x and other.y == org.y:
+                    power = max(0.1, org.energy) * 0.3
+                    other.energy -= power
+                    if other.energy <= 0:
+                        other.cause_of_death = "predation"
+                        org.energy += other.energy * 0.5
+                    break
+
+        elif action_id == Action.REPRODUCE:
+            if org.energy < 3.0:
+                return
+            neighbors = []
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = _wx(org.x + dx), _wy(org.y + dy)
+                if not any(o.x == nx and o.y == ny for o in self.organisms):
+                    neighbors.append((nx, ny))
+            if neighbors:
+                nx, ny = random.choice(neighbors)
+                child_g = org.generation + 1
+                child_vm = org.vm.clone_mutated()
+                child = self._spawn(nx, ny, child_vm.genome,
+                                    energy=org.energy * 0.4,
+                                    generation=child_g)
+                org.energy *= 0.6
+                if child_g > self.max_gen_ever:
+                    self.max_gen_ever = child_g
+                    self.events.append(f"Gen {child_g} reached!")
+                    self._sound("new_gen")
+
+        elif action_id == Action.REST:
+            org.energy += 0.1
+
+        elif action_id == Action.SOUND:
+            vol = min(1.0, max(0.0, org.energy / 10.0))
+            s = _arg % 256
+            org.freq_bass = 40 + (s % 60)
+            org.freq_mid = 180 + ((s * 7) % 400)
+            org.freq_treble = 800 + ((s * 31) % 3200)
+            org.vol_bass = vol * 0.4
+            org.vol_mid = vol * 0.3
+            org.vol_treble = vol * 0.2
+            self.mixer.set_org(org.id,
+                               org.freq_bass, org.vol_bass,
+                               org.freq_mid, org.vol_mid,
+                               org.freq_treble, org.vol_treble)
+
+    async def step(self):
         self.tick += 1
         self.shift_timer -= 1
 
@@ -522,6 +731,7 @@ class World:
             self._shift_environment()
             self.shift_timer = random.randint(*ENV_SHIFT_INTERVAL)
 
+        # Daylight phase (0-1 rotation)
         self.daylight_phase = ((self.tick % DAY_LENGTH) / DAY_LENGTH)
         self.daylight = 0.5 + 0.5 * math.cos(2 * math.pi * self.daylight_phase)
         diurnal_temp = math.cos(2 * math.pi * (self.daylight_phase - 0.25))
@@ -537,45 +747,69 @@ class World:
         if self.pressure < 0.35 and self.daylight < 0.4:
             self.moisture = min(1.0, self.moisture + 0.15)
 
+        # Seasons
         self.season_timer -= 1
         if self.season_timer <= 0:
             self.season = "winter" if self.season == "summer" else "summer"
             self.season_timer = random.randint(*SEASON_LENGTH)
-            self.events.append(
-                f"🌤️ Season: {'☀ summer' if self.season == 'summer' else '❄ winter'}"
-            )
+            self.events.append(f"Season: {'summer' if self.season == 'summer' else 'winter'}")
             self._sound("season")
 
-        dead: Set[int] = set()
+        # Environmental ambient audio — low freq events → bass, high freq events → treble
+        p_dev = abs(self.pressure - 0.5) * 2.0
+        self.mixer.set_ambient("pressure", 40 + p_dev * 40, p_dev * 0.12, 0, 0, 0, 0)
+        self.mixer.set_ambient("moisture", 90 + self.moisture * 80, self.moisture * 0.08,
+                               0, 0, 0, 0)
+        temp_warm = max(0.0, self.temp_diurnal)
+        temp_cold = max(0.0, -self.temp_diurnal)
+        self.mixer.set_ambient("temperature", 50, temp_cold * 0.06,
+                               350 + temp_warm * 250, temp_warm * 0.07,
+                               0, 0)
+        dl_treb = 1000 + self.daylight * 2000
+        self.mixer.set_ambient("daylight", 0, 0, 0, 0,
+                               dl_treb, self.daylight * 0.06)
+        season_bass = 35 if self.season == "summer" else 50
+        self.mixer.set_ambient("season", season_bass, 0.04, 0, 0, 0, 0)
 
-        # --- CARRYING CAPACITY (logistic soft ceiling on reproduction) ---
+        # Carrying capacity
         carry_cap = WIDTH * HEIGHT * 0.4
         n_carry = len(self.organisms)
         carry_pressure = 1.0 + (n_carry / carry_cap) ** 2
 
-        # --- CORPSE DECOMPOSITION (corpses feed adjacent organisms) ---
+        # Corpse decomposition
         for (cx, cy), rtype in list(self.resources.items()):
             if rtype == "corpse":
                 for org in self.organisms:
-                    if org.id not in dead and _tdist(org.x, cx, WIDTH) + _tdist(org.y, cy, HEIGHT) <= 1:
+                    if _tdist(org.x, cx, WIDTH) + _tdist(org.y, cy, HEIGHT) <= 1:
                         org.energy += 0.03
 
-        random.shuffle(self.organisms)
+        # Build dead set for sensor computation
+        self._dead_this_tick: Set[int] = set()
 
-        for org in self.organisms:
+        # Run all organism VMs concurrently
+        async def _run_org(org) -> Tuple[Organism, List[Tuple[int, int]]]:
+            senses = self.compute_senses(org)
+            budget = min(org.energy * 0.4, 8.0)
+            actions = org.vm.execute(budget, senses)
+            return (org, actions)
+
+        results = await asyncio.gather(*[_run_org(o) for o in self.organisms])
+
+        # Apply actions and organism-level systems
+        dead: Set[int] = set()
+
+        for org, actions in results:
             if org.id in dead:
                 continue
 
             org.age += 1
 
-            diet = org.genome[8]
-
-            # --- LIFE STAGE: juvenile penalty, elder bonus ---
+            # Life stage
             if org.age < 3:
                 org.energy -= 0.05
             is_elder = org.age > 30
 
-            # --- TORPOR (hibernation during scarcity) ---
+            # Torpor
             if org.torpor:
                 if org.energy >= 3.0:
                     org.torpor = False
@@ -588,7 +822,8 @@ class World:
             else:
                 torpid = False
 
-            # --- SLEEP CYCLES: rest restores energy faster but leaves vulnerable ---
+            # Sleep cycles
+            asleep = False
             if not torpid:
                 if org.awake:
                     if org.energy < 0.8 and org.age > 5:
@@ -596,222 +831,41 @@ class World:
                         org.sleep_timer = random.randint(3, 8)
                 else:
                     org.sleep_timer -= 1
-                    rest_bonus = 0.08 + org.genome[3] * 0.02
-                    org.energy += rest_bonus
+                    org.energy += 0.08
                     if org.sleep_timer <= 0 or org.energy > 3.0:
                         org.awake = True
             asleep = not org.awake and not torpid
 
-            # --- REGROW (passive energy regen) ---
-            if not torpid and not asleep and org.genome[14] > 0:
-                org.energy += org.genome[14] * 0.015
+            # Apply VM actions
+            if not torpid and not asleep:
+                for act_id, arg in actions:
+                    self.apply_action(org, act_id, arg)
 
-            # --- PARASITE DRAIN: parasites leech energy from host ---
-            if org.parasite and org.host_id is not None:
-                host = None
-                for h in self.organisms:
-                    if h.id == org.host_id and h.id not in dead:
-                        host = h
-                        break
-                if host:
-                    drain = 0.06 + org.genome[2] * 0.02
-                    org.energy += drain
-                    host.energy -= drain
-                    # Host fights back if aggressive
-                    if host.genome[2] > 0 and random.random() < host.genome[2] * 0.1:
-                        org.energy -= 0.2
-                        if org.energy <= 0:
-                            org.cause_of_death = "parasitism"
-                            dead.add(org.id)
-                            continue
-                else:
-                    self.parasites.pop(org.id, None)
-                    org.host_id = None
-                    org.parasite = False
+            # Decay and update action counts for trait evaluation
+            decayed = {}
+            for aid, c in org.action_counts.items():
+                c2 = c * 0.85
+                if c2 > 0.1:
+                    decayed[aid] = c2
+            org.action_counts = decayed
+            if not torpid and not asleep:
+                for act_id, _ in actions:
+                    org.action_counts[act_id] = org.action_counts.get(act_id, 0) + 1.0
 
-            # --- PARASITE INFECTION: low-energy organisms attach to energy-rich hosts ---
-            if not org.parasite and not torpid and not asleep and org.energy < 2.0 and org.genome[2] <= 1:
-                for host_candidate in self.organisms:
-                    if host_candidate is org or host_candidate.id in dead or host_candidate.parasite:
-                        continue
-                    if host_candidate.energy > 3.0 and _tdist(host_candidate.x, org.x, WIDTH) <= 1 and _tdist(host_candidate.y, org.y, HEIGHT) <= 1:
-                        org.parasite = True
-                        org.host_id = host_candidate.id
-                        self.parasites[org.id] = host_candidate.id
-                        org.energy += 0.2  # initial feed
-                        host_candidate.energy -= 0.5  # establishment cost
-                        break
-
-            # --- SENSE & MOVE ---
-            speed = org.genome[0] + 1
-            wander = org.genome[4]
-
-            # Choose target: organism (carnivore/omnivore) or resource (herbivore/omnivore)
-            target = None
-            if diet >= 1:
-                prey = self._nearest_organism(org, dead)
-                if diet == 1:
-                    # Pure carnivore: hunt organisms only
-                    target = (prey.x, prey.y) if prey else None
-                elif diet == 2:
-                    # Omnivore: chase closest of organism or resource
-                    res_target = self._nearest_resource(org)
-                    if prey and res_target:
-                        p_dist = _tdist(prey.x, org.x, WIDTH) + _tdist(prey.y, org.y, HEIGHT)
-                        r_dist = _tdist(res_target[0], org.x, WIDTH) + _tdist(res_target[1], org.y, HEIGHT)
-                        target = (prey.x, prey.y) if p_dist <= r_dist else res_target
-                    elif prey:
-                        target = (prey.x, prey.y)
-                    elif res_target:
-                        target = res_target
-            else:
-                target = self._nearest_resource(org)
-
-            # --- FEAR RESPONSE: herbivores flee from nearby predators ---
-            if diet == 0 and org.genome[1] > 0:
-                sense = org.genome[1]
-                nearest_pred = None
-                min_d = sense + 1
-                for other in self.organisms:
-                    if other is org or other.id in dead or other.genome[8] < 1:
-                        continue
-                    d = _tdist(other.x, org.x, WIDTH) + _tdist(other.y, org.y, HEIGHT)
-                    if d < min_d:
-                        min_d = d
-                        nearest_pred = other
-                if nearest_pred:
-                    flee_p = 0.6
-                    # Sentinel alarm: high-sense herbivores amplify fear
-                    for sentinel in self.organisms:
-                        if sentinel is org or sentinel.id in dead or sentinel.genome[8] != 0:
-                            continue
-                        if sentinel.genome[1] >= 3 and _tdist(sentinel.x, nearest_pred.x, WIDTH) <= 3 and _tdist(sentinel.y, nearest_pred.y, HEIGHT) <= 3:
-                            flee_p = 0.9
-                            break
-                    if random.random() < flee_p:
-                        fx = org.x + (org.x - nearest_pred.x)
-                        fy = org.y + (org.y - nearest_pred.y)
-                        target = (_wx(fx), _wy(fy))
-                    fx = org.x + (org.x - nearest_pred.x)
-                    fy = org.y + (org.y - nearest_pred.y)
-                    target = (_wx(fx), _wy(fy))
-                    org.energy -= 0.05
-
-            if not torpid and target:
-                tx, ty = target
-                steps = min(speed, _tdist(tx, org.x, WIDTH) + _tdist(ty, org.y, HEIGHT))
-                for _ in range(steps):
-                    dx = 1 if tx > org.x else -1 if tx < org.x else 0
-                    dy = 1 if ty > org.y else -1 if ty < org.y else 0
-                    if random.random() < 0.15 + wander * 0.12:
-                        dx += random.choice([-1, 0, 1])
-                        dy += random.choice([-1, 0, 1])
-                    org.x = _wx(org.x + dx)
-                    org.y = _wy(org.y + dy)
-                    if (org.x, org.y) in self.resources:
-                        break
-            elif not torpid:
-                # Memory recall: navigate toward remembered food spots
-                mem_target = None
-                if org.memory:
-                    # Filter out spots that already have an organism on them
-                    occupied = {(o.x, o.y) for o in self.organisms if o.id not in dead}
-                    valid = [m for m in org.memory if m not in occupied]
-                    if valid:
-                        best_d = speed + 1
-                        for m in valid:
-                            d = _tdist(m[0], org.x, WIDTH) + _tdist(m[1], org.y, HEIGHT)
-                            if d < best_d:
-                                best_d = d
-                                mem_target = m
-                if mem_target:
-                    tx, ty = mem_target
-                    steps = min(speed, _tdist(tx, org.x, WIDTH) + _tdist(ty, org.y, HEIGHT))
-                    for _ in range(steps):
-                        dx = 1 if tx > org.x else -1 if tx < org.x else 0
-                        dy = 1 if ty > org.y else -1 if ty < org.y else 0
-                        org.x = _wx(org.x + dx)
-                        org.y = _wy(org.y + dy)
-                        if (org.x, org.y) in self.resources:
-                            break
-                else:
+            # Random wander if no directed movement
+            if not torpid and not asleep:
+                speed = 1 + (org.vm.instr_count // 10)
+                moved = any(
+                    a[0] in (Action.MOVE_N, Action.MOVE_S, Action.MOVE_E,
+                             Action.MOVE_W, Action.MOVE_TOWARD_FOOD, Action.MOVE_AWAY_ORG)
+                    for a in actions
+                )
+                if not moved:
                     for _ in range(speed):
                         org.x = _wx(org.x + random.choice([-1, 0, 1]))
                         org.y = _wy(org.y + random.choice([-1, 0, 1]))
-                # Memory decay
-                if org.memory and random.random() < 0.02:
-                    org.memory.pop(random.randrange(len(org.memory)))
 
-            # --- SEASONAL MIGRATION: north/south drift based on thermal mismatch ---
-            if not torpid and not asleep and org.genome[4] > 0:
-                pref_temp = org.genome[7] / 4.0
-                actual_temp = self._temperature_at(org.y)
-                mismatch = abs(actual_temp - pref_temp)
-                if mismatch > 0.3:
-                    migrate_dir = 1 if actual_temp > pref_temp else -1  # 1=move south, -1=move north
-                    strength = mismatch * org.genome[4] * 0.3
-                    if random.random() < strength:
-                        org.y = _wy(org.y + migrate_dir)
-
-            # --- FLOCKING: low-aggression organisms align with nearby similar hues ---
-            if not torpid and not asleep and org.genome[2] <= 1 and org.genome[8] == 0:
-                avg_dx = 0.0
-                avg_dy = 0.0
-                count = 0
-                for flockmate in self.organisms:
-                    if flockmate is org or flockmate.id in dead:
-                        continue
-                    if _tdist(flockmate.x, org.x, WIDTH) <= 3 and _tdist(flockmate.y, org.y, HEIGHT) <= 3:
-                        hue_diff = abs(org.genome[5] - flockmate.genome[5])
-                        if hue_diff <= 2:
-                            avg_dx += flockmate.x - org.x
-                            avg_dy += flockmate.y - org.y
-                            count += 1
-                if count > 1 and random.random() < 0.4:
-                    dx = int(avg_dx / count)
-                    dy = int(avg_dy / count)
-                    if dx or dy:
-                        org.x = _wx(org.x + (1 if dx > 0 else -1 if dx < 0 else 0))
-                        org.y = _wy(org.y + (1 if dy > 0 else -1 if dy < 0 else 0))
-
-            # --- TERRITORY MARKING: aggression marks position with scent ---
-            if org.genome[2] > 0:
-                tpos = (org.x, org.y)
-                if tpos not in self.territory:
-                    self.territory[tpos] = {}
-                hue = org.genome[5]
-                self.territory[tpos][hue] = self.territory[tpos].get(hue, 0) + 1
-
-            # --- TERRITORY COST: standing on foreign territory costs energy ---
-            if org.genome[2] > 0:
-                tpos = (org.x, org.y)
-                if tpos in self.territory:
-                    my_hue = org.genome[5]
-                    foreign = sum(c for h, c in self.territory[tpos].items() if h != my_hue)
-                    if foreign > 0:
-                        org.energy -= 0.02 * min(3, foreign)
-
-            # --- PARASITE HOST DEATH CHECK: when host dies, parasite reproduces ---
-            if org.parasite and org.host_id is not None:
-                host_dead = org.host_id in dead or not any(o.id == org.host_id for o in self.organisms)
-                if host_dead:
-                    org.parasite = False
-                    org.host_id = None
-                    self.parasites.pop(org.id, None)
-                    # Bonus energy from host death
-                    org.energy += 1.0
-                    # Chance to spawn offspring parasite
-                    if org.energy > 4.0 and random.random() < 0.3:
-                        neighbors = [(_wx(org.x+dx), _wy(org.y+dy)) for dx,dy in [(0,1),(0,-1),(1,0),(-1,0)]
-                                     if not any(o.x == _wx(org.x+dx) and o.y == _wy(org.y+dy) for o in self.organisms if o.id not in dead)]
-                        if neighbors:
-                            nx, ny = random.choice(neighbors)
-                            child = self._spawn(nx, ny, self._mutate(org.genome, MUT_RATES[org.genome[6]]), 1.5, org.generation + 1)
-                            child.parasite = True
-                            if child.generation > self.max_gen_ever:
-                                self.max_gen_ever = child.generation
-
-            # --- NEST BUILDING: spend energy to build permanent shelter ---
+            # Nest building
             if not torpid and not asleep and org.energy > 3.0:
                 npos = (org.x, org.y)
                 if npos not in self.nests and random.random() < 0.05:
@@ -820,7 +874,6 @@ class World:
                 elif npos in self.nests:
                     self.nests[npos] += 1
 
-            # --- NEST BENEFIT: nests buffer temperature ---
             nest_bonus = 0.0
             if (org.x, org.y) in self.nests:
                 nest_bonus = 0.3
@@ -832,280 +885,97 @@ class World:
                     k = random.choice(list(self.nests.keys()))
                     del self.nests[k]
 
-            # --- HORIZONTAL GENE TRANSFER (swap genes with adjacent organisms) ---
-            if not torpid and random.random() < 0.03:
-                for hgt_other in self.organisms:
-                    if hgt_other is org or hgt_other.id in dead:
-                        continue
-                    if _tdist(hgt_other.x, org.x, WIDTH) <= 1 and _tdist(hgt_other.y, org.y, HEIGHT) <= 1:
-                        i = random.randrange(len(GENES))
-                        org.genome[i], hgt_other.genome[i] = hgt_other.genome[i], org.genome[i]
-                        break
+            # Territory marking
+            hue = (org.id + org.generation) % 6
+            tpos = (org.x, org.y)
+            if tpos not in self.territory:
+                self.territory[tpos] = {}
+            self.territory[tpos][hue] = self.territory[tpos].get(hue, 0) + 1
 
-            # --- CONSUME RESOURCE ---
-            pos = (org.x, org.y)
-            if not torpid and pos in self.resources:
-                rtype = self.resources.pop(pos)
-                base_val = RESOURCE_TYPES[rtype]["value"]
-                met_bonus = 1.0 + org.genome[3] * 0.2
-                # Age-foraging bonus: peaks at middle age
-                age_bonus = min(org.age, 30) / 30.0 * 0.3
-                met_bonus += age_bonus
-                if diet == 0:
-                    met_bonus += 0.3
-                elif diet == 1 and rtype == "corpse":
-                    met_bonus += 0.4
-                org.energy += base_val * met_bonus
-                # Soil fertility bonus from previous grazing
-                fert = self.soil_fertility.get(pos, 0.0)
-                if fert > 0 and rtype in ("food", "bounty"):
-                    org.energy += fert * 0.2
-                    self.soil_fertility[pos] = max(0.0, fert - 0.05)
-                # Spatial memory: remember good foraging spots
-                if rtype in ("food", "bounty"):
-                    org.memory.append(pos)
-                    if len(org.memory) > 3:
-                        org.memory.pop(0)
-                # Niche construction: herbivores enrich soil
-                if diet == 0 and rtype == "food":
-                    self.soil_fertility[pos] = self.soil_fertility.get(pos, 0.0) + 0.1
+            # Territory cost
+            if tpos in self.territory:
+                foreign = sum(c for h, c in self.territory[tpos].items() if h != hue)
+                if foreign > 0:
+                    org.energy -= 0.02 * min(3, foreign)
 
-            # --- METABOLIC COST ---
-            base_cost = SUMMER_BASE_COST if self.season == "summer" else WINTER_BASE_COST
-            base_cost += org.genome[3] * 0.15
-            size_cost = (org.genome[0] + org.genome[2]) * 0.01
-            speed_cost = org.genome[0] * 0.02
-            sense_cost = org.genome[1] * 0.025
-            agg_cost = org.genome[2] * 0.015
-            if diet == 2:
-                agg_cost += 0.02
-            tox_cost = org.genome[9] * 0.01
-            pref_temp = org.genome[7] / 4.0
-            actual_temp = self._temperature_at(org.y)
-            thermal_cost = abs(actual_temp - pref_temp) * 0.25
-            mult = 0.1 if torpid else 1.0
-            if asleep:
-                mult = 0.0
-            org.energy -= (base_cost + size_cost + speed_cost + sense_cost + agg_cost + thermal_cost * (1.0 - nest_bonus) + tox_cost) * mult
-
-            # --- FIGHT (overlapping organisms) ---
+            # Fight overlapping organisms
             if not torpid:
                 for other in self.organisms:
                     if other is org or other.id in dead:
                         continue
                     if other.x == org.x and other.y == org.y:
-                        a = org.genome[2]
-                        b = other.genome[2]
-                        ham = sum(1 for i in range(len(GENES)) if org.genome[i] != other.genome[i])
-                        kin_mod = 0.3 if ham <= 2 else 1.0
-                        if a > 0 and b > 0:
-                            org_power = max(0, org.energy) * (a + 1) / 4 * kin_mod
-                            other_power = max(0, other.energy) * (b + 1) / 4 * kin_mod
-                            total = org_power + other_power
-                            shield_def = 1.0 - other.genome[12] * 0.15
-                            if total > 0 and random.random() < org_power / total:
-                                other.cause_of_death = "fighting"
-                                org.energy += other.energy * 0.25 * shield_def
-                                dead.add(other.id)
-                            else:
-                                org.cause_of_death = "fighting"
-                                shield_atk = 1.0 - org.genome[12] * 0.15
-                                other.energy += org.energy * 0.25 * shield_atk
-                                dead.add(org.id)
-                                break
-                        elif a > 0 and random.random() < a / 3 * kin_mod:
+                        a = min(3, org.vm.instr_count // 20)
+                        b = min(3, other.vm.instr_count // 20)
+                        org_power = max(0, org.energy) * (a + 1) / 4
+                        other_power = max(0, other.energy) * (b + 1) / 4
+                        total = org_power + other_power
+                        if total > 0 and random.random() < org_power / total:
                             other.cause_of_death = "fighting"
-                            shield_def = 1.0 - other.genome[12] * 0.15
-                            org.energy += other.energy * 0.2 * shield_def
+                            org.energy += other.energy * 0.25
                             dead.add(other.id)
+                        else:
+                            org.cause_of_death = "fighting"
+                            other.energy += org.energy * 0.25
+                            dead.add(org.id)
+                            break
 
             if org.id in dead:
                 continue
 
-            # --- HUNTING (carnivores actively attack adjacent organisms) ---
-            if not torpid and diet >= 1:
+            # Eat if standing on food (automatic, not just from ACT)
+            if not torpid:
+                pos = (org.x, org.y)
+                if pos in self.resources:
+                    rtype = self.resources.pop(pos)
+                    base_val = RESOURCE_TYPES[rtype]["value"]
+                    age_bonus = min(org.age, 30) / 30.0 * 0.3
+                    org.energy += base_val * (1.0 + age_bonus)
+                    fert = self.soil_fertility.get(pos, 0.0)
+                    if fert > 0 and rtype in ("food", "bounty"):
+                        org.energy += fert * 0.2
+                        self.soil_fertility[pos] = max(0.0, fert - 0.05)
+                    if rtype in ("food", "bounty"):
+                        self.soil_fertility[pos] = self.soil_fertility.get(pos, 0.0) + 0.1
+
+            # Metabolic cost
+            base_cost = SUMMER_BASE_COST if self.season == "summer" else WINTER_BASE_COST
+            mult = 0.1 if torpid else 1.0
+            if asleep:
+                mult = 0.0
+            org.energy -= (base_cost + 0.02) * mult
+
+            # HGT: horizontal genome transfer
+            if not torpid and random.random() < 0.02:
                 for other in self.organisms:
                     if other is org or other.id in dead:
                         continue
-                    stealth = other.genome[13]
-                    if random.random() < stealth * 0.12:
-                        continue
                     if _tdist(other.x, org.x, WIDTH) <= 1 and _tdist(other.y, org.y, HEIGHT) <= 1:
-                        a = org.genome[2]
-                        b = other.genome[2]
-                        # Pack hunting: nearby predators coordinate
-                        pack_count = 0
-                        for packmate in self.organisms:
-                            if packmate is org or packmate.id in dead or packmate.genome[8] < 1:
-                                continue
-                            if _tdist(packmate.x, other.x, WIDTH) <= 2 and _tdist(packmate.y, other.y, HEIGHT) <= 2:
-                                pack_count += 1
-                        pack_bonus = 1.0 + pack_count * 0.15
-                        atk_mult = (1.5 if diet == 1 else 1.0) * pack_bonus
-                        # Prey camouflage: hue matching temperature zone defends
-                        prey_hue = other.genome[5]
-                        prey_y_zone = int(5 * (1.0 - other.y / (HEIGHT - 1)))
-                        camo = 1.0 - abs(prey_hue - prey_y_zone) / 5.0
-                        # Herding defense: nearby prey protect each other
-                        herd_count = 0
-                        for herdmate in self.organisms:
-                            if herdmate is other or herdmate.id in dead or herdmate.genome[8] >= 1:
-                                continue
-                            if _tdist(herdmate.x, other.x, WIDTH) <= 2 and _tdist(herdmate.y, other.y, HEIGHT) <= 2:
-                                herd_count += 1
-                        herd_bonus = 1.0 + herd_count * 0.15
-                        # Cannibalism: starving predators attack any organism including own species
-                        is_cannibal = org.energy < 1.0 and diet >= 1
-                        if is_cannibal:
-                            ham = sum(1 for i in range(len(GENES)) if org.genome[i] != other.genome[i])
-                            if ham <= 1 and random.random() < 0.3:
-                                break  # kin recognition inhibits cannibalism of nearly-identical
-                        # Prey bioluminescence attracts predators (easier to spot)
-                        prey_lumen = other.genome[10]
-                        lumen_spot = 1.0 + prey_lumen * 0.3
-                        # Predator learned avoidance of toxic hues
-                        predator_hue = org.genome[5]
-                        learned = self.predator_memory.get(predator_hue, set())
-                        if prey_hue in learned and random.random() < 0.4:
-                            break  # predator hesitates, doesn't attack
-                        # --- MIMICRY: harmless prey mimicking toxic hues gain protection ---
-                        mimic_bonus = 1.0
-                        if other.genome[9] == 0:
-                            nearby_toxic_hues = set()
-                            for mim in self.organisms:
-                                if mim is other or mim.id in dead:
-                                    continue
-                                if mim.genome[9] >= 2 and _tdist(mim.x, other.x, WIDTH) <= 5 and _tdist(mim.y, other.y, HEIGHT) <= 5:
-                                    nearby_toxic_hues.add(mim.genome[5])
-                            if nearby_toxic_hues and other.genome[5] in nearby_toxic_hues:
-                                mimic_bonus = 0.75  # predator confuses mimic with toxic model
-                            if nearby_toxic_hues and other.genome[5] in learned:
-                                mimic_bonus = 0.6
-                        # Müllerian convergence: generalize learned avoidance to adjacent hues
-                        if org.genome[5] in learned and other.genome[9] >= 2:
-                            for dh in (-1, 1):
-                                adj_hue = (other.genome[5] + dh) % 6
-                                if predator_hue not in self.predator_memory:
-                                    self.predator_memory[predator_hue] = set()
-                                self.predator_memory[predator_hue].add(adj_hue)
-                        org_power = max(0.1, org.energy) * (a + 1) / 4 * atk_mult * lumen_spot * (1.3 if is_cannibal else 1.0) * mimic_bonus
-                        other_power = max(0.1, other.energy) * (b + 1) / 4 * (1.0 + camo * 0.5) * herd_bonus
-                        total = org_power + other_power
-                        if random.random() < org_power / total:
-                            gain = other.energy * 0.6
-                            if diet == 1:
-                                gain *= 1.3
-                            org.energy += gain
-                            # Prey toxin damages predator
-                            tox = other.genome[9]
-                            if tox > 0:
-                                org.energy -= tox * 0.4
-                                # Predator learns to avoid this hue
-                                pred_hue = org.genome[5]
-                                if pred_hue not in self.predator_memory:
-                                    self.predator_memory[pred_hue] = set()
-                                self.predator_memory[pred_hue].add(other.genome[5])
-                            other.cause_of_death = "predation"
-                            dead.add(other.id)
-                            break  # satiated for this tick
-                        else:
-                            # Failed hunt — prey fights back, predator injured
-                            org.energy -= other.energy * 0.2
-                            if org.energy <= 0:
-                                org.cause_of_death = "predation"
-                                dead.add(org.id)
-                            break
+                        i = random.randrange(min(len(org.genome), len(other.genome)))
+                        org.vm.genome[i], other.vm.genome[i] = other.vm.genome[i], org.vm.genome[i]
+                        break
 
-            if org.id in dead:
-                continue
-
-            # --- SYMBIOSIS (herbivore + carnivore mutualism) ---
-            if not torpid and diet < 2:
-                for sym_other in self.organisms:
-                    if sym_other is org or sym_other.id in dead:
-                        continue
-                    if (diet == 0 and sym_other.genome[8] == 1) or (diet == 1 and sym_other.genome[8] == 0):
-                        if _tdist(sym_other.x, org.x, WIDTH) <= 1 and _tdist(sym_other.y, org.y, HEIGHT) <= 1:
-                            org.energy += 0.03
-                            break
-
-            # --- KIN SELECTION (similar genomes share energy) ---
-            if not torpid and org.energy > 1.5:
-                for kin in self.organisms:
-                    if kin is org or kin.id in dead:
-                        continue
-                    if _tdist(kin.x, org.x, WIDTH) <= 1 and _tdist(kin.y, org.y, HEIGHT) <= 1:
-                        ham = sum(1 for i in range(len(GENES)) if org.genome[i] != kin.genome[i])
-                        if ham <= 2 and kin.energy < org.energy - 0.5:
-                            give = min(0.1, org.energy - 0.5)
-                            org.energy -= give
-                            kin.energy += give
-                            break
-
-            # --- ALTRUISTIC PUNISHMENT: aggressive organisms punish cheaters ---
-            if not torpid and org.genome[2] >= 2 and org.energy > 2.0:
-                for cheater in self.organisms:
-                    if cheater is org or cheater.id in dead or cheater.genome[2] > org.genome[2]:
-                        continue
-                    if _tdist(cheater.x, org.x, WIDTH) <= 2 and _tdist(cheater.y, org.y, HEIGHT) <= 2:
-                        if cheater.energy > 3.0:
-                            starving_nearby = any(
-                                o is not org and o.id not in dead and o.energy < 0.5
-                                and _tdist(o.x, cheater.x, WIDTH) <= 2 and _tdist(o.y, cheater.y, HEIGHT) <= 2
-                                for o in self.organisms
-                            )
-                            if starving_nearby:
-                                org.energy -= 0.15
-                                cheater.energy -= 0.4
-                                if cheater.energy <= 0:
-                                    cheater.cause_of_death = "fighting"
-                                    dead.add(cheater.id)
-                                break
-
-            # --- PARENTAL CARE (parent feeds nearby young children) ---
-            if org.pupils and org.energy > 1.0:
-                expired = []
-                for cid, remaining in org.pupils.items():
-                    if remaining <= 0:
-                        expired.append(cid)
-                        continue
-                    for child in self.organisms:
-                        if child.id == cid and child.id not in dead:
-                            if _tdist(child.x, org.x, WIDTH) <= 2 and _tdist(child.y, org.y, HEIGHT) <= 2:
-                                give = min(0.02, org.energy - 0.5)
-                                org.energy -= give
-                                child.energy += give
-                            break
-                    org.pupils[cid] = remaining - 1
-                for cid in expired:
-                    del org.pupils[cid]
-
-            # --- DISEASE ---
+            # Disease
             if org.id in self.diseased:
-                # Spread BEFORE drain so patient zero infects others before dying
                 for other in self.organisms:
                     if other.id in dead or other.id in self.diseased or other.id in self.immune:
                         continue
                     if _tdist(other.x, org.x, WIDTH) <= 2 and _tdist(other.y, org.y, HEIGHT) <= 2:
                         if random.random() < 0.20:
                             self.diseased.add(other.id)
-
-                met = org.genome[3]
-                drain = 0.12 * max(0.1, 1.0 - met * 0.15)
+                drain = 0.12
                 org.energy -= drain
-                if random.random() < 0.05 + met * 0.05:
+                if random.random() < 0.05:
                     self.diseased.discard(org.id)
                     self.immune.add(org.id)
 
             if org.id in dead:
                 continue
 
-            # Immune wanes over time
             if org.id in self.immune and random.random() < 0.005:
                 self.immune.discard(org.id)
 
-            # --- FAT METABOLISM: store excess energy, draw during scarcity ---
-            fat_cap = 1.0 + org.genome[3] * 1.5
+            # Fat metabolism
+            fat_cap = 2.0
             if org.energy > 2.0 and org.fat < fat_cap:
                 store = min(org.energy - 2.0, fat_cap - org.fat, 0.5)
                 org.fat += store
@@ -1115,123 +985,60 @@ class World:
                 org.fat -= draw
                 org.energy += draw * 0.7
 
-            # --- STARVATION ---
+            # Starvation
             if org.energy <= 0:
                 org.cause_of_death = "disease" if org.id in self.diseased else "starvation"
                 dead.add(org.id)
                 continue
 
-            # --- OLD AGE ---
-            size = org.genome[0] + org.genome[2]
-            max_age = 180 // (org.genome[3] + 1) + 60 + size * 5
+            # Old age
+            max_age = 120 + (org.vm.instr_count % 100)
             if org.age > max_age:
                 org.cause_of_death = "old_age"
                 dead.add(org.id)
                 continue
 
-            # --- DENSITY-DEPENDENT FERTILITY ---
-            local_density = sum(
+            # Reproduction
+            density = sum(
                 1 for o in self.organisms
                 if o is not org and o.id not in dead
                 and _tdist(o.x, org.x, WIDTH) + _tdist(o.y, org.y, HEIGHT) <= 3
             )
-            density_penalty = 1.0 + max(0, local_density - 3) * 0.15
-
-            # --- REPRODUCTION ---
+            density_penalty = 1.0 + max(0, density - 3) * 0.15
             repro_thresh = REPRODUCTION_THRESHOLD * density_penalty * carry_pressure
-            sex_thresh = SEXUAL_THRESHOLD * density_penalty * carry_pressure
             if is_elder:
                 repro_thresh *= 0.8
-                sex_thresh *= 0.8
-            if (
-                org.energy >= repro_thresh
-                or (org.energy >= sex_thresh
-                    and any(
-                        o is not org and o.id not in dead
-                        and o.energy >= sex_thresh
-                        and _tdist(o.x, org.x, WIDTH) <= 1 + o.genome[10]
-                        and _tdist(o.y, org.y, HEIGHT) <= 1 + o.genome[10]
-                        for o in self.organisms
-                    ))
-            ):
-                # Try to find a mate for sexual reproduction
-                mate = None
-                # Only seek mate if both have >= sex_thresh
-                if org.energy >= sex_thresh:
-                    for other in self.organisms:
-                        if other is org or other.id in dead:
-                            continue
-                        if other.energy >= sex_thresh:
-                            dx = _tdist(other.x, org.x, WIDTH)
-                            dy = _tdist(other.y, org.y, HEIGHT)
-                            max_range = 1 + max(org.genome[10], other.genome[10])
-                            if dx <= max_range and dy <= max_range:
-                                mate = other
-                                break
-
-                # Find adjacent empty cell
-                neighbors = []
-                for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
-                    nx, ny = _wx(org.x + dx), _wy(org.y + dy)
-                    if not any(
-                        o.x == nx and o.y == ny
-                        for o in self.organisms
-                        if o.id not in dead
-                    ):
-                        neighbors.append((nx, ny))
-                if neighbors:
-                    nx, ny = random.choice(neighbors)
-                    if mate:
-                        # SEXUAL: recombine genomes from both parents
-                        child_genome = []
-                        for i in range(len(GENES)):
-                            if random.random() < 0.5:
-                                child_genome.append(org.genome[i])
-                            else:
-                                child_genome.append(mate.genome[i])
-                        child_genome = self._mutate(child_genome, MUT_RATES[org.genome[6]])
-                        child_genome = self._transpose(child_genome, MUT_RATES[org.genome[6]] * 0.5)
-                        child_gen = max(org.generation, mate.generation) + 1
-                        size = org.genome[0] + org.genome[2]
-                        energy_cost = ENERGY_COST_PER_CHILD * 0.7 * (1.0 + size * 0.08)
-                        child = self._spawn(nx, ny, child_genome, energy_cost, child_gen)
-                        org.pupils[child.id] = 5
-                        if mate is not org:
-                            mate.pupils[child.id] = 5
-                        org.energy -= energy_cost
-                        mate.energy -= energy_cost
-                        if child_gen > self.max_gen_ever:
-                            self.max_gen_ever = child_gen
-                            self.events.append(
-                                f"⚡ Gen {self.max_gen_ever} (sexual! "
-                                f"{GLYPH_SET[child_genome[5] % len(GLYPH_SET)]})"
-                            )
-                            self._sound("new_gen")
-                    elif org.energy >= repro_thresh:
-                        # ASEXUAL: clone + mutate
-                        child_genome = self._mutate(org.genome, MUT_RATES[org.genome[6]])
-                        child_genome = self._transpose(child_genome, MUT_RATES[org.genome[6]] * 0.5)
-                        size = org.genome[0] + org.genome[2]
-                        cost_mult = 1.0 + size * 0.08
-                        child = self._spawn(nx, ny, child_genome, ENERGY_COST_PER_CHILD * cost_mult, org.generation + 1)
-                        org.pupils[child.id] = 5
-                        org.energy -= ENERGY_COST_PER_CHILD * 1.1 * cost_mult
-                        if org.generation + 1 > self.max_gen_ever:
-                            self.max_gen_ever = org.generation + 1
-                            self.events.append(
-                                f"⚡ Gen {self.max_gen_ever} reached! "
-                                f"({GLYPH_SET[child_genome[5] % len(GLYPH_SET)]})"
-                            )
+            if org.energy >= repro_thresh:
+                for act_id, _ in actions:
+                    if act_id == Action.REPRODUCE:
+                        break
+                else:
+                    # Auto-reproduce at threshold
+                    neighbors = []
+                    for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        nx, ny = _wx(org.x + dx), _wy(org.y + dy)
+                        if not any(o.x == nx and o.y == ny for o in self.organisms):
+                            neighbors.append((nx, ny))
+                    if neighbors:
+                        nx, ny = random.choice(neighbors)
+                        child_g = org.generation + 1
+                        child_vm = org.vm.clone_mutated()
+                        self._spawn(nx, ny, child_vm.genome,
+                                    energy=ENERGY_COST_PER_CHILD,
+                                    generation=child_g)
+                        org.energy -= ENERGY_COST_PER_CHILD
+                        if child_g > self.max_gen_ever:
+                            self.max_gen_ever = child_g
+                            self.events.append(f"Gen {child_g} reached!")
                             self._sound("new_gen")
 
-        # Remove dead — but leave corpse resources
+        # Remove dead
         pop_before = len(self.organisms)
         dead_list = []
         kept = []
         for o in self.organisms:
             if o.id in dead:
                 dead_list.append(o)
-                # Track death cause
                 if o.cause_of_death:
                     self.death_stats[o.cause_of_death] = self.death_stats.get(o.cause_of_death, 0) + 1
                 else:
@@ -1241,12 +1048,12 @@ class World:
         self.organisms = kept
         pop_after = len(self.organisms)
         died = pop_before - pop_after
-        # Clean up diseased IDs for dead organisms
         self.diseased &= {o.id for o in self.organisms}
+
+        # Corpse resources
         for o in dead_list:
+            self.mixer.remove_org(o.id)
             if random.random() < 0.5 and (o.x, o.y) not in self.resources:
-                bounty_val = min(2.5, 0.3 + o.energy * 0.3)
-                # corpseless corpses become food; energy-rich corpses become bounty-ish
                 rtype = "corpse" if o.energy > 1.0 else "food"
                 self._add_resource(o.x, o.y, rtype)
 
@@ -1255,114 +1062,7 @@ class World:
             if o.age > self.max_age_ever:
                 self.max_age_ever = o.age
 
-        # Gene loss detection
-        current_gene_vals = [set() for _ in GENES]
-        for o in self.organisms:
-            for i, v in enumerate(o.genome):
-                current_gene_vals[i].add(v)
-        lost_this_tick = []
-        for i, (expected, actual) in enumerate(zip(self.genes_found, current_gene_vals)):
-            lost = expected - actual
-            if lost:
-                lost_this_tick.append((i, lost))
-                self.genes_found[i] = current_gene_vals[i]
-        for gene_idx, lost_vals in lost_this_tick:
-            for v in lost_vals:
-                self.events.append(
-                    f"🧬 Extinct: {GENES[gene_idx][0]}={v} "
-                    f"(lost from population)"
-                )
-                self._sound("gene_extinct")
-
-        # Record history
-        self.pop_history.append(pop_after)
-        if len(self.pop_history) > 60:
-            self.pop_history = self.pop_history[-60:]
-
-        # Sonify tick state
-        self.sonify_counter += 1
-        if self.sonify_counter % 3 == 0:
-            self._sonify_tick()
-
-        # Population crash event
-        if died > 5 and pop_after > 0:
-            self.events.append(f"💀 {died} died in a single tick")
-            self._sound("mass_death")
-
-        # Population recovery event
-        if pre_pop < 10 and pop_after > pre_pop and pop_after >= 10:
-            self.events.append(f"🌱 Population recovered to {pop_after}")
-            self._sound("recovery")
-
-        # Extinction-level event tracking
-        if pop_after < self.min_pop_ever:
-            self.min_pop_ever = pop_after
-            if pop_after <= 3:
-                entry = f"⚠ CRITICAL: pop={pop_after} at T={self.tick} (max_gen={self.max_gen_ever})"
-                self.extinction_log.append(entry)
-                self.events.append(f"⚠ Only {pop_after} organisms remain!")
-                self._sound("critical")
-                self._log_extinction("CRITICAL", pop_after)
-            elif pop_after <= 10:
-                entry = f"📉 Bottleneck: pop={pop_after} at T={self.tick} (max_gen={self.max_gen_ever})"
-                self.extinction_log.append(entry)
-                self.events.append(f"📉 Population bottleneck: {pop_after}")
-                self._sound("bottleneck")
-                self._log_extinction("BOTTLENECK", pop_after)
-
-        # Radiation spike — injects genetic variation
-        if self.tick > 50 and random.random() < 0.008:
-            n_mutated = 0
-            for org in self.organisms:
-                i = random.randint(0, len(GENES) - 1)
-                g_min, g_max = GENES[i][1], GENES[i][2]
-                delta = random.choice([-1, 1])
-                old = org.genome[i]
-                n_unique = len(set(o.genome[i] for o in self.organisms))
-                candidate = org.genome[i] + delta
-                if candidate < 0:
-                    candidate = 0
-                elif candidate < g_min and n_unique >= 3:
-                    candidate = g_min
-                elif candidate > g_max and n_unique >= 3:
-                    candidate = g_max
-                org.genome[i] = candidate
-                if org.genome[i] != old:
-                    n_mutated += 1
-            if n_mutated > 0:
-                self.events.append(f"☢ Radiation spike — {n_mutated} organisms mutated")
-                self._sound("radiation")
-
-        # Spontaneous disease outbreak
-        if not self.diseased and len(self.organisms) > 25 and random.random() < 0.03:
-            candidates = [o for o in self.organisms if o.energy > 1.5]
-            if len(candidates) >= 2:
-                n = random.randint(2, min(5, len(candidates)))
-                victims = random.sample(candidates, n)
-                for v in victims:
-                    self.diseased.add(v.id)
-                self.events.append(f"🦠 Disease outbreak! {len(victims)} infected")
-                self._sound("disease")
-        elif self.diseased and random.random() < 0.002 and len(self.diseased) > 10:
-            self.events.append(f"🦠 Epidemic: {len(self.diseased)} infected")
-            self._sound("epidemic")
-
-        # --- MIGRATION (invasion from outside) ---
-        self.migration_timer -= 1
-        if self.migration_timer <= 0:
-            batch = random.randint(*MIGRATION_BATCH)
-            for _ in range(batch):
-                x = random.randint(0, WIDTH - 1)
-                y = random.randint(0, HEIGHT - 1)
-                genome = [random.randint(g[1], g[2]) for g in GENES]
-                self._spawn(x, y, genome, 4.0)
-            self.events.append(
-                f"🌊 {batch} invaders arrived from beyond"
-            )
-            self._sound("migration")
-            self.migration_timer = random.randint(*MIGRATION_INTERVAL)
-
-        # --- FOSSIL RECORD: track extinct lineages ---
+        # Fossil record
         current_genomes = {tuple(o.genome) for o in self.organisms}
         newly_extinct = self.all_genomes_seen - current_genomes - self.recorded_fossils
         if newly_extinct:
@@ -1370,33 +1070,50 @@ class World:
                 self.recorded_fossils.add(g)
                 self.fossil_lineages.append(g)
             self.fossil_count += len(newly_extinct)
-            self.events.append(
-                f"🦴 {len(newly_extinct)} lineage(s) fossilized "
-                f"(total: {self.fossil_count})"
-            )
+            self.events.append(f"{len(newly_extinct)} lineage(s) fossilized (total: {self.fossil_count})")
             self._sound("fossil")
 
-        # --- REGENERATE RESOURCES ---
+        # History
+        self.pop_history.append(pop_after)
+        if len(self.pop_history) > 60:
+            self.pop_history = self.pop_history[-60:]
+
+        # Population events
+        if died > 5 and pop_after > 0:
+            self.events.append(f"{died} died in a single tick")
+            self._sound("mass_death")
+        if pre_pop < 10 and pop_after > pre_pop and pop_after >= 10:
+            self.events.append(f"Population recovered to {pop_after}")
+            self._sound("recovery")
+        if pop_after < self.min_pop_ever:
+            self.min_pop_ever = pop_after
+            if pop_after <= 3:
+                self.extinction_log.append(f"CRITICAL: pop={pop_after} at T={self.tick}")
+                self.events.append(f"Only {pop_after} organisms remain!")
+                self._sound("critical")
+                self._log_extinction("CRITICAL", pop_after)
+            elif pop_after <= 10:
+                self.extinction_log.append(f"Bottleneck: pop={pop_after} at T={self.tick}")
+                self.events.append(f"Population bottleneck: {pop_after}")
+                self._sound("bottleneck")
+                self._log_extinction("BOTTLENECK", pop_after)
+
+        # Regenerate resources
         regen = SUMMER_REGEN if self.season == "summer" else WINTER_REGEN
         for _ in range(regen):
             if len(self.resources) < WIDTH * HEIGHT * 0.25:
                 x, y = random.randint(0, WIDTH - 1), random.randint(0, HEIGHT - 1)
                 if (x, y) not in self.resources:
-                    rtype = random.choices(
-                        RESOURCE_KEYS,
-                        weights=[t["weight"] for t in RESOURCE_TYPES.values()]
-                    )[0]
+                    rtype = random.choices(RESOURCE_KEYS, weights=[t["weight"] for t in RESOURCE_TYPES.values()])[0]
                     self._add_resource(x, y, rtype)
 
-        # Track fitness
+        # Fitness history
         if self.organisms:
-            self.fitness_history.append(
-                sum(o.energy for o in self.organisms) / len(self.organisms)
-            )
+            self.fitness_history.append(sum(o.energy for o in self.organisms) / len(self.organisms))
         if len(self.fitness_history) > 80:
             self.fitness_history = self.fitness_history[-80:]
 
-        # --- TERRITORY DECAY ---
+        # Territory decay
         decayed = []
         for tpos, hues in self.territory.items():
             for h in list(hues.keys()):
@@ -1412,24 +1129,28 @@ class World:
                 k = random.choice(list(self.territory.keys()))
                 del self.territory[k]
 
+        # Migration
+        self.migration_timer -= 1
+        if self.migration_timer <= 0:
+            batch = random.randint(*MIGRATION_BATCH)
+            for _ in range(batch):
+                x = random.randint(0, WIDTH - 1)
+                y = random.randint(0, HEIGHT - 1)
+                self._spawn(x, y, random_genome(random.randint(18, 60)), 4.0)
+            self.events.append(f"{batch} invaders arrived from beyond")
+            self._sound("migration")
+            self.migration_timer = random.randint(*MIGRATION_INTERVAL)
+
     def _shift_environment(self):
         remove_n = int(len(self.resources) * random.uniform(0.15, 0.4))
-        self.events.append(
-            f"🌋 Environment shift: -{remove_n} resources, "
-            f"+clusters in new locations"
-        )
+        self.events.append(f"Environment shift: -{remove_n} resources, +clusters")
         self._sound("env_shift")
         if self.tick > 100 and random.random() < 0.25:
-            self.events.append(
-                f"🔥 Environmental stress event — all organisms lose energy"
-            )
+            self.events.append("Environmental stress event")
             self._sound("stress")
         if remove_n > 0 and self.resources:
-            for pos in random.sample(
-                list(self.resources.keys()), min(remove_n, len(self.resources))
-            ):
+            for pos in random.sample(list(self.resources.keys()), min(remove_n, len(self.resources))):
                 del self.resources[pos]
-
         clusters = random.randint(2, 5)
         for _ in range(clusters):
             cx = random.randint(6, WIDTH - 6)
@@ -1440,253 +1161,191 @@ class World:
                 if (x, y) not in self.resources:
                     rtype = random.choices(RESOURCE_KEYS, weights=[t["weight"] for t in RESOURCE_TYPES.values()])[0]
                     self._add_resource(x, y, rtype)
-
         if random.random() < 0.3:
             for org in self.organisms:
                 org.energy -= random.uniform(0.5, 1.5)
 
     def render(self) -> str:
+        phase = (self.tick % DAY_LENGTH) / DAY_LENGTH
+
         grid = [[" " for _ in range(WIDTH)] for _ in range(HEIGHT)]
 
+        # Resources
         for (x, y), rtype in self.resources.items():
             occupied = any(o.x == x and o.y == y for o in self.organisms)
             if not occupied:
                 grid[y][x] = RESOURCE_TYPES[rtype]["symbol"]
 
-        # Render nests under unoccupied cells
+        # Nests under unoccupied cells
         for (x, y), strength in self.nests.items():
             occupied = any(o.x == x and o.y == y for o in self.organisms)
             if not occupied and grid[y][x] == " ":
                 nest_age = min(4, strength // 10)
                 nest_sym = ["░", "▒", "▓", "█", "█"][nest_age]
-                grid[y][x] = f"{DIM}\033[33m{nest_sym}{RESET}"
+                grid[y][x] = f"\033[33m{nest_sym}{RESET}"
 
-        # Render territory as subtle background on unoccupied cells
+        # Territory as background on unoccupied
         TERR_COLORS = ["\033[41m", "\033[42m", "\033[44m", "\033[45m", "\033[46m"]
         for (x, y), hues in self.territory.items():
             occupied = any(o.x == x and o.y == y for o in self.organisms)
             if not occupied and grid[y][x] == " ":
                 dom_hue = max(hues, key=hues.get)
                 tc = TERR_COLORS[dom_hue % len(TERR_COLORS)]
-                grid[y][x] = f"{DIM}{tc} {RESET}"
+                grid[y][x] = f"{tc} {RESET}"
 
-        # Find sentinel (most-evolved organism)
+        # Organisms
         sentinel = max(self.organisms, key=lambda o: o.generation) if self.organisms else None
         sentinel_id = sentinel.id if sentinel else -1
 
         for org in self.organisms:
-                diet = org.genome[8]
-                if diet == 1:
-                    glyph = "⬢"
-                    color = COLORS[org.genome[5] % len(COLORS)]
-                elif diet == 2:
-                    glyph = "⬟"
-                    color = COLORS[org.genome[5] % len(COLORS)]
-                else:
-                    glyph = GLYPH_SET[org.genome[5] % len(GLYPH_SET)]
-                    color = COLORS[org.genome[5] % len(COLORS)]
-                lumen = org.genome[10]
-                if not org.awake:
-                    grid[org.y][org.x] = f"{DIM}\033[44m{color} {RESET}"
-                elif org.parasite:
-                    grid[org.y][org.x] = f"{BOLD}\033[42m{color}{glyph}{RESET}"
-                elif org.id == sentinel_id and org.generation > 0:
-                    grid[org.y][org.x] = f"{BOLD}\033[47m\033[30m{glyph}{RESET}"
-                elif org.id in self.diseased:
-                    grid[org.y][org.x] = f"{BOLD}\033[41m{color}{glyph}{RESET}"
-                elif lumen >= 2:
-                    grid[org.y][org.x] = f"{BOLD}\033[43m{color}{glyph}{RESET}"
-                elif lumen >= 1:
-                    grid[org.y][org.x] = f"\033[43m{color}{glyph}{RESET}"
-                elif org.torpor:
-                    grid[org.y][org.x] = f"{DIM}\033[44m{color}{glyph}{RESET}"
-                elif org.fat > 1.5:
-                    grid[org.y][org.x] = f"{BOLD}\033[43m{color}{glyph}{RESET}"
-                elif org.genome[9] >= 2:
-                    grid[org.y][org.x] = f"{BOLD}\033[45m\033[97m{glyph}{RESET}"
-                elif org.genome[9] > 0:
-                    grid[org.y][org.x] = f"{BOLD}\033[45m{color}{glyph}{RESET}"
-                elif org.energy > 7:
-                    grid[org.y][org.x] = f"{BOLD}{color}{glyph}{RESET}"
-                elif org.energy > 3:
-                    grid[org.y][org.x] = f"{color}{glyph}{RESET}"
-                else:
-                    grid[org.y][org.x] = f"{DIM}{color}{glyph}{RESET}"
+            hue = (org.id + org.generation) % len(GLYPH_SET)
+            glyph = GLYPH_SET[hue]
+            color = COLORS[hue % len(COLORS)]
+            dl = self._daylight_at(org.x, phase)
 
-        TEMP_COLORS = ["\033[34m", "\033[32m", "\033[33m", "\033[31m"]
-        lines = [f"{BOLD}╔{'═' * WIDTH}╗{RESET}"]
+            if org.id == sentinel_id and org.generation > 0:
+                grid[org.y][org.x] = f"{BOLD}\033[47m\033[30m{glyph}{RESET}"
+            elif org.id in self.diseased:
+                grid[org.y][org.x] = f"{BOLD}\033[41m{color}{glyph}{RESET}"
+            elif dl < 0.2:
+                grid[org.y][org.x] = f"{DIM}{color}{glyph}{RESET}"
+            elif dl < 0.5:
+                grid[org.y][org.x] = f"{color}{glyph}{RESET}"
+            elif org.torpor:
+                grid[org.y][org.x] = f"{DIM}{color}{glyph}{RESET}"
+            elif org.energy > 7:
+                grid[org.y][org.x] = f"{BOLD}{color}{glyph}{RESET}"
+            elif org.energy > 3:
+                grid[org.y][org.x] = f"{color}{glyph}{RESET}"
+            else:
+                grid[org.y][org.x] = f"{DIM}{color}{glyph}{RESET}"
+
+        def _hl(dl: float) -> str:
+            if dl > 0.6:
+                return f"{BOLD}\033[103m\033[30m═{RESET}"
+            elif dl > 0.3:
+                return f"{BOLD}\033[43m\033[30m═{RESET}"
+            elif dl > 0.15:
+                return f"{BOLD}\033[45m\033[37m═{RESET}"
+            return f"{BOLD}\033[44m\033[37m═{RESET}"
+
+        top_bar = f"{BOLD}╔{RESET}" + "".join(_hl(self._daylight_at(x, phase)) for x in range(WIDTH)) + f"{BOLD}╗{RESET}"
+        bot_bar = f"{BOLD}╚{RESET}" + "".join(_hl(self._daylight_at(x, phase)) for x in range(WIDTH)) + f"{BOLD}╝{RESET}"
+
+        lines = [top_bar]
         for y, row in enumerate(grid):
-            temp_idx = min(3, int((1.0 - y / (HEIGHT - 1)) * 4))
-            tc = TEMP_COLORS[temp_idx]
-            lines.append(f"{BOLD}{tc}║{RESET}{''.join(row)}{BOLD}{tc}║{RESET}")
-        lines.append(f"{BOLD}╚{'═' * WIDTH}╝{RESET}")
+            lines.append(f"{BOLD}║{RESET}{''.join(row)}{BOLD}║{RESET}")
+        lines.append(bot_bar)
 
-        if self.organisms:
-            n = len(self.organisms)
+        # Status
+        n = len(self.organisms)
+        if n > 0:
             avg_e = sum(o.energy for o in self.organisms) / n
-            max_g = max(o.generation for o in self.organisms)
-            avg_spd = sum(o.genome[0] for o in self.organisms) / n
-            avg_agg = sum(o.genome[2] for o in self.organisms) / n
-            avg_met = sum(o.genome[3] for o in self.organisms) / n
-            avg_mut = sum(o.genome[6] for o in self.organisms) / n
-            avg_tmp = sum(o.genome[7] for o in self.organisms) / n
-            avg_diet = sum(o.genome[8] for o in self.organisms) / n
-            avg_tox = sum(o.genome[9] for o in self.organisms) / n
-            avg_lumen = sum(o.genome[10] for o in self.organisms) / n
-            avg_fat = sum(o.fat for o in self.organisms) / n
-            n_herb = sum(1 for o in self.organisms if o.genome[8] == 0)
-            n_carn = sum(1 for o in self.organisms if o.genome[8] == 1)
-            n_omni = sum(1 for o in self.organisms if o.genome[8] == 2)
-            n_sleep = sum(1 for o in self.organisms if not o.awake)
-            n_parasite = sum(1 for o in self.organisms if o.parasite)
-            species = len({tuple(o.genome) for o in self.organisms})
-
-            # Dominant genome
-            genome_counts: Dict[Tuple[int, ...], int] = {}
-            for o in self.organisms:
-                key = tuple(o.genome)
-                genome_counts[key] = genome_counts.get(key, 0) + 1
-            dominant_key = max(genome_counts, key=genome_counts.get) if genome_counts else ()
-            dominant_pct = genome_counts.get(dominant_key, 0) / n * 100
-            dominant_glyph = GLYPH_SET[dominant_key[5] % len(GLYPH_SET)] if dominant_key else "?"
-            shannon = -sum((c/n) * math.log(c/n) for c in genome_counts.values()) if genome_counts else 0.0
+            max_g = self.max_gen_ever
+            sp = len({tuple(o.genome) for o in self.organisms})
             avg_age = sum(o.age for o in self.organisms) / n
-            young = sum(1 for o in self.organisms if o.age <= 5)
-            mid = sum(1 for o in self.organisms if 5 < o.age <= 30)
-            old = sum(1 for o in self.organisms if o.age > 30)
-            avg_carn_spd = sum(o.genome[0] for o in self.organisms if o.genome[8] == 1) / max(1, n_carn)
-            avg_herb_spd = sum(o.genome[0] for o in self.organisms if o.genome[8] == 0) / max(1, n_herb)
-        else:
-            avg_e = max_g = avg_spd = avg_agg = avg_met = avg_mut = avg_tmp = avg_diet = avg_tox = avg_lumen = avg_fat = species = n = 0
-            n_herb = n_carn = n_omni = 0
-            n_sleep = 0
-            n_parasite = 0
-            young = mid = old = 0
-            dominant_key = ()
-            dominant_pct = 0
-            dominant_glyph = "?"
             shannon = 0.0
-            avg_age = 0.0
-            avg_carn_spd = avg_herb_spd = 0.0
-
-        lines.append(
-            f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  Age:{avg_age:.1f}  "
-            f"Sp:{species:2d}  H\u2019:{shannon:.2f}  Fos:{self.fossil_count:4d}  "
-            f"Y:{young} M:{mid} O:{old}  "
-            f"H:{n_herb} C:{n_carn} O:{n_omni}  Spd:{avg_spd:.1f}  "
-            f"Agg:{avg_agg:.1f}  Met:{avg_met:.1f}  "
-            f"\u03bcMut:{avg_mut:.1f}  Tm:{avg_tmp:.1f}  Tx:{avg_tox:.1f}  "
-            f"Lu:{avg_lumen:.1f}  "
-            f"Ft:{avg_fat:.2f}  "
-            f"Res:{len(self.resources):3d}  Ns:{len(self.nests):2d}  Tr:{len(self.territory):2d}  "
-            f"Sl:{n_sleep:2d}  Ps:{n_parasite:2d}  "
-            f"Inf:{len(self.diseased):2d}  Imm:{len(self.immune):2d}  "
-            f"†S:{self.death_stats.get('starvation',0)} P:{self.death_stats.get('predation',0)} "
-            f"F:{self.death_stats.get('fighting',0)} O:{self.death_stats.get('old_age',0)} "
-            f"D:{self.death_stats.get('disease',0)} "
-            f"{'☀' if self.season == 'summer' else '\u2744'}{'S' if self.season == 'summer' else 'W'}  T:{self.tick}"
-        )
-        if n_herb > 0 or n_carn > 0:
+            if sp > 0:
+                gc: Dict[str, int] = {}
+                for o in self.organisms:
+                    k = str(o.genome[:6])
+                    gc[k] = gc.get(k, 0) + 1
+                shannon = -sum((c/n) * math.log(c/n) for c in gc.values())
             lines.append(
-                f"  \u2694 carns:{avg_carn_spd:.1f}  herbs:{avg_herb_spd:.1f}  "
-                f"gap:{avg_carn_spd - avg_herb_spd:+.1f}"
+                f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  Age:{avg_age:.1f}  "
+                f"Sp:{sp:2d}  H\u2019:{shannon:.2f}  Fos:{self.fossil_count:4d}  "
+                f"Res:{len(self.resources):3d}  "
+                f"{'☀ sum' if self.season == 'summer' else '\u2744 win'}  T:{self.tick}"
             )
 
-        # Population sparkline (compact)
-        if self.pop_history:
-            max_pop = max(self.pop_history)
-            min_pop = min(self.pop_history)
-            span = max_pop - min_pop if max_pop > min_pop else 1
-            SPARK = "▁▂▃▄▅▆▇█"
-            sparkline = ""
-            window = self.pop_history[-min(60, len(self.pop_history)):]
-            for p in window:
-                idx = int((p - min_pop) / span * (len(SPARK) - 1))
-                sparkline += SPARK[idx]
-            lines.append(f"  └{'─' * min(50, len(window))}  {sparkline}")
+            # Day-night terminator bar
+            term = int(phase * WIDTH)
+            dn_bar = ""
+            for x in range(WIDTH):
+                dl = self._daylight_at(x, phase)
+                if dl > 0.6:
+                    dn_bar += "░"
+                elif dl > 0.3:
+                    dn_bar += "▒"
+                else:
+                    dn_bar += "█"
+            lines.append(f"  [day-night] {dn_bar}")
 
-        # Fitness sparkline (rolling avg energy)
-        if len(self.fitness_history) > 5:
-            feats = self.fitness_history[-40:]
-            mn, mx = min(feats), max(feats)
-            rng = mx - mn if mx > mn else 1
-            fitline = ""
-            for f in feats:
-                idx = int((f - mn) / rng * 7)
-                fitline += "▁▂▃▄▅▆▇█"[idx]
-            lines.append(f"  └fit              {fitline}")
+            # Population sparkline
+            if self.pop_history:
+                max_pop = max(self.pop_history)
+                min_pop = min(self.pop_history)
+                span = max_pop - min_pop if max_pop > min_pop else 1
+                SPARK = "▁▂▃▄▅▆▇█"
+                sparkline = ""
+                window = self.pop_history[-min(60, len(self.pop_history)):]
+                for p in window:
+                    idx = int((p - min_pop) / span * (len(SPARK) - 1))
+                    sparkline += SPARK[idx]
+                lines.append(f"  └{'─' * min(50, len(window))}  {sparkline}")
 
-        # Gene frequency bars (compact histogram per gene)
-        if self.organisms:
-            labels = ["spd", "sen", "agg", "met", "wnd", "hue", "mut", "tmp", "die", "tox", "lum", "sig", "shd", "stl", "rgw", "imm"]
-            bar_parts = []
-            for i, (label, (_, g_min, g_max)) in enumerate(zip(labels, GENES)):
-                span = g_max - g_min + 1
-                vals = [o.genome[i] for o in self.organisms]
-                lo, hi = min(vals), max(vals)
-                lo = min(lo, g_min)
-                hi = max(hi, g_max)
-                counts = [0] * (hi - lo + 1)
-                for v in vals:
-                    counts[v - lo] += 1
-                max_c = max(counts) if max(counts) > 0 else 1
-                bars = "".join(
-                    " ▁▂▃▄▅▆▇█"[min(7, int(c / max_c * 7))]
-                    for c in counts
+            # Fitness sparkline
+            if len(self.fitness_history) > 5:
+                feats = self.fitness_history[-40:]
+                mn, mx = min(feats), max(feats)
+                rng = mx - mn if mx > mn else 1
+                fitline = ""
+                for f in feats:
+                    idx = int((f - mn) / rng * 7)
+                    fitline += "▁▂▃▄▅▆▇█"[idx]
+                lines.append(f"  └fit              {fitline}")
+
+            # Dominant genome fingerprint
+            gc: Dict[str, int] = {}
+            for o in self.organisms:
+                k = str(o.genome[:6])
+                gc[k] = gc.get(k, 0) + 1
+            dom = max(gc, key=gc.get) if gc else "?"
+            pct = gc.get(dom, 0) / n * 100 if n else 0
+            lines.append(f"  dom VM[:6]: {dom} ({pct:.0f}%)")
+
+            # Sentinel
+            if sentinel and sentinel.generation > 0:
+                OP_NAMES = ["NOP","MOV","ADD","SUB","MUL","DIV","JMP","JZ","JG","JL",
+                            "SENSE","ACT","PUSH","POP","CALL","RET","HALT","RAND","ENERGY",
+                            "MOD","CMP","AND","OR","XOR","NOT","IND"]
+                g = sentinel.genome
+                decoded = []
+                for i in range(0, min(len(g), 54), 3):
+                    if i + 2 >= len(g):
+                        break
+                    op = g[i] % Op.TOTAL
+                    a1 = g[i+1] % 256
+                    a2 = g[i+2] % 256
+                    decoded.append(f"{OP_NAMES[op]}({a1},{a2})")
+                prog = " ".join(decoded[:18])
+                lines.append(
+                    f"  sentinel: gen={sentinel.generation} age={sentinel.age} "
+                    f"⚡={sentinel.energy:.1f} len={len(sentinel.genome)}"
                 )
-                bar_parts.append(f"{label} {bars}")
-            lines.append("  " + "  ".join(bar_parts))
+                lines.append(f"  └vm: {prog}")
+                if len(decoded) > 18:
+                    lines.append(f"  └...({len(decoded)-18} more)")
 
-        # Dominant genome line
-        if dominant_key:
-            genome_str = " ".join(str(g) for g in dominant_key)
-            lines.append(
-                f"  {BOLD}{dominant_glyph}{RESET} {_species_name(dominant_key)}: [{genome_str}] "
-                f"({dominant_pct:.0f}% of pop)"
-            )
-
-        # Sentinel genome (most-evolved organism)
-        if sentinel and sentinel.generation > 0:
-            g = sentinel.genome
-            tag = " 🦠" if sentinel.id in self.diseased else ""
-            lines.append(
-                f"  {BOLD}\033[47m\033[30m{GLYPH_SET[g[5] % len(GLYPH_SET)]}"
-                f"\033[0m {_species_name(tuple(g))}: [{' '.join(str(v) for v in g)}]"
-                f"  gen={sentinel.generation}  age={sentinel.age}  ⚡={sentinel.energy:.1f}{tag}"
-            )
-
-        # Events (last 3)
+        # Events
         self.events = self.events[-3:]
         for ev in self.events:
             lines.append(f"  {ev}")
-        lines.append(
-            "  " + " ".join(
-                f"{COLORS[i]}{GLYPH_SET[i]}{RESET}{GENES[i][0]}"
-                for i in range(min(len(GENES), len(GLYPH_SET)))
-            ) + f"  {BOLD}·{RESET}food {BOLD}★{RESET}bounty {BOLD}✿{RESET}corpse"
-        )
+
         return "\n".join(lines)
 
 
-def main():
+async def main():
     global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT
-    parser = argparse.ArgumentParser(description="Evolutionary ecosystem simulator")
-    parser.add_argument("--volume", type=float, default=SOUND_VOLUME,
-                        help=f"sound volume 0-1 (default: {SOUND_VOLUME})")
-    parser.add_argument("--no-sound", action="store_true",
-                        help="disable all sounds")
-    parser.add_argument("--tick-rate", type=float, default=TICK_RATE,
-                        help=f"seconds per tick (default: {TICK_RATE})")
-    parser.add_argument("--log", default=EXTINCTION_LOG_FILE,
-                        help=f"extinction log file (default: {EXTINCTION_LOG_FILE})")
-    parser.add_argument("--seed", type=int, default=SEED,
-                        help=f"random seed (default: {SEED})")
-    parser.add_argument("--width", type=int, default=WIDTH,
-                        help=f"grid width (default: {WIDTH})")
-    parser.add_argument("--height", type=int, default=HEIGHT,
-                        help=f"grid height (default: {HEIGHT})")
-    parser.add_argument("--continuous", action="store_true",
-                        help="auto-restart after extinction, accumulate log across runs")
+    parser = argparse.ArgumentParser(description="VM-genome evolutionary ecosystem")
+    parser.add_argument("--volume", type=float, default=SOUND_VOLUME)
+    parser.add_argument("--no-sound", action="store_true")
+    parser.add_argument("--tick-rate", type=float, default=TICK_RATE)
+    parser.add_argument("--log", default=EXTINCTION_LOG_FILE)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--width", type=int, default=WIDTH)
+    parser.add_argument("--height", type=int, default=HEIGHT)
+    parser.add_argument("--continuous", action="store_true")
     args = parser.parse_args()
     if args.no_sound:
         SOUND_ENABLED = False
@@ -1712,23 +1371,22 @@ def main():
         interrupted = False
         try:
             while world.organisms:
-                print(world.render())
-                world.step()
-                time.sleep(TICK_RATE)
-                print("\033[H", end="")
+                sys.stdout.write("\033[H")
+                sys.stdout.write(world.render())
+                sys.stdout.flush()
+                await world.step()
+                await asyncio.sleep(TICK_RATE)
         except KeyboardInterrupt:
             interrupted = True
 
-        total_extinct = sum(
-            len(set(range(g[1], g[2]+1)) - world.genes_found[i])
-            for i, g in enumerate(GENES)
-        )
-        print(f"\n\n{'═' * 40}")
+        world.mixer.stop()
+        total_extinct = 0
+        print(f"\n{'═' * 40}")
         if not world.organisms:
-            print(f"  ✦  Extinction at T={world.tick} (run {run_count})")
+            print(f"  Extinction at T={world.tick} (run {run_count})")
             world._log_extinction("TOTAL_EXTINCTION", 0)
         elif interrupted:
-            print(f"  ✦  Halted after {world.tick} ticks (run {run_count})")
+            print(f"  Halted after {world.tick} ticks (run {run_count})")
             world._log_extinction("SNAPSHOT", len(world.organisms))
         print(f"  Pop: {len(world.organisms)}  "
               f"Generations: {world.max_gen_ever}  "
@@ -1737,31 +1395,21 @@ def main():
         print(f"  Species now: {len({tuple(o.genome) for o in world.organisms})}  "
               f"Infected: {len(world.diseased)}  "
               f"Fossil lineages: {world.fossil_count}")
-        if total_extinct:
-            print(f"  Gene values lost: {total_extinct}")
         if world.extinction_log:
-            print(f"\n  {'─' * 36}")
             print(f"  Extinction events ({len(world.extinction_log)} total):")
             for entry in world.extinction_log[-5:]:
                 print(f"  {entry}")
 
         if not continuous or interrupted:
             print(f"\n  Extinction log written to {EXTINCTION_LOG_FILE}")
-            if not world.organisms:
-                print(f"\n  Extinction cause: Last {len(world.organisms)} organism(s)")
-                if world.organisms:
-                    last = world.organisms[0]
-                    print(f"  Genome: [{' '.join(str(v) for v in last.genome)}]")
-                    print(f"  Age: {last.age}  Energy: {last.energy:.1f}")
             print(f"{'═' * 40}")
             break
 
-        print(f"  🔄 Run {run_count} done — restarting with seed {SEED}")
+        print(f"  Run {run_count} done — restarting with seed {SEED}")
         print(f"{'═' * 40}")
         time.sleep(0.5)
         print("\033c", end="")
 
 
-
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
