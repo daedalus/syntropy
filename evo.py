@@ -504,6 +504,9 @@ class Organism:
     age: int
     generation: int
     id: int
+    genome_a: List[int] = field(default_factory=list)
+    genome_b: List[int] = field(default_factory=list)
+    active_bank: int = 0
     fat: float = 0.0
     torpor: bool = False
     awake: bool = True
@@ -520,7 +523,7 @@ class Organism:
 
     @property
     def genome(self) -> list:
-        return self.vm.genome
+        return self.genome_a
 
 
 def _tdist(a: int, b: int, size: int) -> int:
@@ -542,6 +545,21 @@ def _next_oid() -> int:
     global _next_id
     _next_id += 1
     return _next_id
+
+
+def _mutate_genome(genome: List[int], rate: float = 0.06) -> List[int]:
+    ng = list(genome)
+    for i in range(len(ng)):
+        if random.random() < rate:
+            ng[i] = max(0, min(255, ng[i] + random.choice([-2, -1, 1, 2])))
+    if random.random() < rate * 0.4 and len(ng) < 600:
+        idx = (random.randrange(0, len(ng) + 1) // 3) * 3
+        ng[idx:idx] = [random.randint(0, Op.TOTAL - 1),
+                       random.randint(0, 255), random.randint(0, 255)]
+    if random.random() < rate * 0.2 and len(ng) > 9:
+        idx = (random.randrange(0, len(ng)) // 3) * 3
+        ng = ng[:idx] + ng[idx + 3:]
+    return ng
 
 
 def random_genome(length: int = 30) -> List[int]:
@@ -674,11 +692,18 @@ class World:
         self.resources[(x, y)] = rtype
 
     def _spawn(
-        self, x: int, y: int, genome: list, energy: float = 3.0, generation: int = 0
+        self, x: int, y: int, genome: list, energy: float = 3.0, generation: int = 0,
+        genome_b: Optional[List[int]] = None, active_bank: int = 0
     ) -> Organism:
+        ga = list(genome)
+        gb = list(genome_b) if genome_b is not None else list(genome)
+        vm = GenomeVM(genome=ga)
         org = Organism(
             x=_wx(x), y=_wy(y),
-            vm=GenomeVM(genome=genome),
+            vm=vm,
+            genome_a=ga,
+            genome_b=gb,
+            active_bank=active_bank,
             energy=energy,
             age=0,
             generation=generation,
@@ -690,8 +715,9 @@ class World:
             vol_mid=0.0,
             vol_treble=0.0,
         )
+        org.vm.genome = ga
         self.organisms.append(org)
-        self.all_genomes_seen.add(tuple(genome))
+        self.all_genomes_seen.add(tuple(ga))
         return org
 
     def _temperature_at(self, y: int) -> float:
@@ -889,15 +915,21 @@ class World:
                 cost = ENERGY_COST_PER_CHILD * 0.6
                 org.energy -= cost
                 mate.energy -= cost * 0.5
-                child_vm = org.vm.crossover(mate.vm)
-                child_vm = child_vm.clone_mutated()
-                self._spawn(nx, ny, child_vm.genome,
+                cross = org.vm.crossover(mate.vm)
+                child_ga = _mutate_genome(cross.genome)
+                child_gb = _mutate_genome(cross.genome)
+                self._spawn(nx, ny, child_ga,
+                            genome_b=child_gb,
+                            active_bank=random.randint(0, 1),
                             energy=2.5, generation=child_g)
             else:
                 cost = ENERGY_COST_PER_CHILD * 0.6
                 org.energy -= cost
-                child_vm = org.vm.clone_mutated()
-                self._spawn(nx, ny, child_vm.genome,
+                child_ga = _mutate_genome(org.genome_a)
+                child_gb = _mutate_genome(org.genome_b)
+                self._spawn(nx, ny, child_ga,
+                            genome_b=child_gb,
+                            active_bank=random.randint(0, 1),
                             energy=2.0, generation=child_g)
                 if child_g > self.max_gen_ever:
                     self.max_gen_ever = child_g
@@ -996,6 +1028,7 @@ class World:
 
         # Run all organism VMs concurrently
         async def _run_org(org) -> Tuple[Organism, List[Tuple[int, int]], Dict[int, float]]:
+            org.vm.genome = org.genome_a if org.active_bank == 0 else org.genome_b
             senses = self.compute_senses(org)
             budget = min(org.energy * 0.4, 8.0)
             actions = org.vm.execute(budget, senses, tick=self.tick)
@@ -1076,6 +1109,16 @@ class World:
             if not torpid and not asleep:
                 for act_id, *__ in actions:
                     org.action_counts[act_id] = org.action_counts.get(act_id, 0) + 1.0
+
+            # Gene conversion: copy byte from inactive to active bank
+            if random.random() < 0.02:
+                if org.active_bank == 0:
+                    src, dst = org.genome_b, org.genome_a
+                else:
+                    src, dst = org.genome_a, org.genome_b
+                if src and dst:
+                    i = random.randrange(min(len(src), len(dst)))
+                    dst[i] = src[i]
 
             # Genome-determined drift when VM produces no movement actions
             if not torpid and not asleep:
@@ -1239,10 +1282,11 @@ class World:
 
             # Mutation pressure from reproduction overhead
             if org.energy >= repro_thresh * 1.5 and random.random() < 0.03:
-                if len(org.vm.genome) < 600 and random.random() < 0.5:
-                    idx = (random.randrange(0, len(org.vm.genome) + 1) // 3) * 3
-                    org.vm.genome[idx:idx] = [random.randint(0, Op.TOTAL - 1),
-                                              random.randint(0, 255), random.randint(0, 255)]
+                target = org.genome_a if random.random() < 0.5 else org.genome_b
+                if len(target) < 600 and random.random() < 0.5:
+                    idx = (random.randrange(0, len(target) + 1) // 3) * 3
+                    target[idx:idx] = [random.randint(0, Op.TOTAL - 1),
+                                       random.randint(0, 255), random.randint(0, 255)]
 
         # Remove dead
         pop_before = len(self.organisms)
@@ -1563,7 +1607,8 @@ class World:
                 prog = " ".join(decoded[:18])
                 lines.append(
                     f"  sentinel: gen={sentinel.generation} age={sentinel.age} "
-                    f"⚡={sentinel.energy:.1f} len={len(sentinel.genome)}"
+                    f"⚡={sentinel.energy:.1f} len={len(sentinel.genome)} "
+                    f"bank={'B' if sentinel.active_bank else 'A'}"
                 )
                 lines.append(f"  └vm: {prog}")
                 if len(decoded) > 18:
@@ -1676,7 +1721,8 @@ async def main():
                     decoded.append(f"{OP_NAMES[op]}({a1},{a2})")
                 prog = " ".join(decoded[:18])
                 print(f"  Best VM: gen={best.generation} age={best.age:.0f} "
-                      f"⚡={best.energy:.1f} len={len(best.genome)}")
+                      f"⚡={best.energy:.1f} len={len(best.genome)} "
+                      f"bank={'B' if best.active_bank else 'A'} ({len(best.genome_b)}b)")
                 print(f"  └vm: {prog}")
                 if len(decoded) > 18:
                     print(f"  └...({len(decoded)-18} more)")
