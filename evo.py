@@ -98,6 +98,7 @@ class World:
         self.fossil_lineages: List[Tuple[int, ...]] = []
         self.season = "summer"
         self.season_timer = random.randint(*SEASON_LENGTH)
+        self.diseased: Set[int] = set()
 
         for _ in range(INITIAL_RESOURCES):
             rtype = random.choices(RESOURCE_KEYS, weights=[t["weight"] for t in RESOURCE_TYPES.values()])[0]
@@ -259,6 +260,25 @@ class World:
             if org.id in dead:
                 continue
 
+            # --- DISEASE ---
+            if org.id in self.diseased:
+                # Spread BEFORE drain so patient zero infects others before dying
+                for other in self.organisms:
+                    if other.id in dead or other.id in self.diseased:
+                        continue
+                    if abs(other.x - org.x) <= 2 and abs(other.y - org.y) <= 2:
+                        if random.random() < 0.20:
+                            self.diseased.add(other.id)
+
+                met = org.genome[3]
+                drain = 0.12 * max(0.1, 1.0 - met * 0.15)
+                org.energy -= drain
+                if random.random() < 0.05 + met * 0.05:
+                    self.diseased.discard(org.id)
+
+            if org.id in dead:
+                continue
+
             # --- STARVATION ---
             if org.energy <= 0:
                 dead.add(org.id)
@@ -395,6 +415,18 @@ class World:
         if pre_pop < 10 and pop_after > pre_pop and pop_after >= 10:
             self.events.append(f"🌱 Population recovered to {pop_after}")
 
+        # Spontaneous disease outbreak
+        if not self.diseased and len(self.organisms) > 25 and random.random() < 0.03:
+            candidates = [o for o in self.organisms if o.energy > 1.5]
+            if len(candidates) >= 2:
+                n = random.randint(2, min(5, len(candidates)))
+                victims = random.sample(candidates, n)
+                for v in victims:
+                    self.diseased.add(v.id)
+                self.events.append(f"🦠 Disease outbreak! {len(victims)} infected")
+        elif self.diseased and random.random() < 0.002 and len(self.diseased) > 10:
+            self.events.append(f"🦠 Epidemic: {len(self.diseased)} infected")
+
         # --- MIGRATION (invasion from outside) ---
         self.migration_timer -= 1
         if self.migration_timer <= 0:
@@ -478,8 +510,9 @@ class World:
                 glyph = GLYPH_SET[org.genome[5] % len(GLYPH_SET)]
                 color = COLORS[org.genome[5] % len(COLORS)]
                 if org.id == sentinel_id and org.generation > 0:
-                    # Sentinel: blinking/reverse effect with extra brightness
                     grid[org.y][org.x] = f"{BOLD}\033[47m\033[30m{glyph}{RESET}"
+                elif org.id in self.diseased:
+                    grid[org.y][org.x] = f"{BOLD}\033[41m{color}{glyph}{RESET}"
                 elif org.energy > 7:
                     grid[org.y][org.x] = f"{BOLD}{color}{glyph}{RESET}"
                 elif org.energy > 3:
@@ -521,7 +554,7 @@ class World:
             f"Sp:{species:2d}  Speed:{avg_spd:.1f}  "
             f"Agg:{avg_agg:.1f}  Met:{avg_met:.1f}  "
             f"μMut:{avg_mut:.1f}  "
-            f"Res:{len(self.resources):3d}  MaxAge:{self.max_age_ever:3d}  "
+            f"Res:{len(self.resources):3d}  Inf:{len(self.diseased):2d}  "
             f"{'☀' if self.season == 'summer' else '❄'}{'S' if self.season == 'summer' else 'W'}  T:{self.tick}"
         )
 
@@ -576,10 +609,11 @@ class World:
         # Sentinel genome (most-evolved organism)
         if sentinel and sentinel.generation > 0:
             g = sentinel.genome
+            tag = " 🦠" if sentinel.id in self.diseased else ""
             lines.append(
                 f"  {BOLD}\033[47m\033[30m{GLYPH_SET[g[5] % len(GLYPH_SET)]}"
                 f"\033[0m sentinel: [{g[0]} {g[1]} {g[2]} {g[3]} {g[4]} {g[5]} {g[6]}]"
-                f"  gen={sentinel.generation}  age={sentinel.age}  ⚡={sentinel.energy:.1f}"
+                f"  gen={sentinel.generation}  age={sentinel.age}  ⚡={sentinel.energy:.1f}{tag}"
             )
 
         # Events (last 3)
@@ -613,8 +647,9 @@ def main():
         print(f"  ✦  Evolution halted after {world.tick} ticks")
         print(f"  Pop: {len(world.organisms)}  "
               f"Generations: {world.max_gen_ever}  "
-              f"Max age: {world.max_age_ever}")
-        print(f"  Species now: {len({tuple(o.genome) for o in world.organisms})}")
+              f"Max age: {world.max_age_ever}  ")
+        print(f"  Species now: {len({tuple(o.genome) for o in world.organisms})}  "
+              f"Infected: {len(world.diseased)}")
         if total_extinct:
             print(f"  Gene values lost to extinction: {total_extinct}")
         print(f"{'═' * 40}")
