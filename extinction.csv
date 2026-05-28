@@ -1,0 +1,10 @@
+tick,event,pop,max_gen,season
+155,BOTTLENECK,9,27,winter
+156,BOTTLENECK,7,27,winter
+157,BOTTLENECK,6,27,winter
+159,BOTTLENECK,5,27,winter
+162,BOTTLENECK,4,27,winter
+164,CRITICAL,3,27,winter
+178,CRITICAL,2,27,winter
+2839,BOTTLENECK,4,312,winter
+2840,CRITICAL,2,312,winter
