@@ -1644,6 +1644,31 @@ async def main():
             for entry in world.extinction_log[-5:]:
                 print(f"  {entry}")
 
+        # Best VM
+        if world.organisms:
+            best = max(world.organisms, key=lambda o: o.generation)
+            if best.generation > 0:
+                OP_NAMES = ["NOP","MOV","ADD","SUB","MUL","DIV","JMP","JZ","JG","JL",
+                            "SENSE","ACT","PUSH","POP","CALL","RET","HALT","RAND","ENERGY",
+                            "MOD","CMP","AND","OR","XOR","NOT","IND","MIN","MAX","ABS","NEG","DUP","JNE",
+                            "SWAP","GEN","PICK","DPTH","PC","SETPC","SQRT","EXP","TICK","DROP","OVER",
+                            "SHL","SHR","BIT"]
+                g = best.genome
+                decoded = []
+                for i in range(0, min(len(g), 54), 3):
+                    if i + 2 >= len(g):
+                        break
+                    op = g[i] % Op.TOTAL
+                    a1 = g[i+1] % 256
+                    a2 = g[i+2] % 256
+                    decoded.append(f"{OP_NAMES[op]}({a1},{a2})")
+                prog = " ".join(decoded[:18])
+                print(f"  Best VM: gen={best.generation} age={best.age:.0f} "
+                      f"⚡={best.energy:.1f} len={len(best.genome)}")
+                print(f"  └vm: {prog}")
+                if len(decoded) > 18:
+                    print(f"  └...({len(decoded)-18} more)")
+
         if not continuous or interrupted:
             print(f"\n  Extinction log written to {EXTINCTION_LOG_FILE}")
             print(f"{'═' * 40}")
