@@ -37,6 +37,7 @@ REPRODUCTION_THRESHOLD = 6.0
 ENERGY_COST_PER_CHILD = 3.0
 ENV_SHIFT_INTERVAL = (30, 60)
 DAY_LENGTH = 120
+MAX_SYSTEM_ENERGY = 200
 MIGRATION_INTERVAL = (80, 150)
 MIGRATION_BATCH = (3, 8)
 TICK_RATE = 0.06
@@ -1203,6 +1204,14 @@ class World:
                     rtype = random.choices(RESOURCE_KEYS, weights=[t["weight"] for t in RESOURCE_TYPES.values()])[0]
                     self._add_resource(x, y, rtype)
 
+        # System energy cap
+        total_energy = sum(o.energy + o.fat for o in self.organisms)
+        if total_energy > MAX_SYSTEM_ENERGY:
+            ratio = MAX_SYSTEM_ENERGY / total_energy
+            for o in self.organisms:
+                o.energy *= ratio
+                o.fat *= ratio
+
         # Fitness history
         if self.organisms:
             self.fitness_history.append(sum(o.energy for o in self.organisms) / len(self.organisms))
@@ -1352,7 +1361,7 @@ class World:
                 f"Sp:{sp:2d}  H\u2019:{shannon:.2f}  Fos:{self.fossil_count:4d}  "
                 f"Res:{len(self.resources):3d}  "
                 f"{'☀ sum' if self.season == 'summer' else '\u2744 win'}  "
-                f"T:{self.tick}  max_age:{max(o.age for o in self.organisms):.0f}"
+                f"T:{self.tick}  tot:{sum(o.energy+o.fat for o in self.organisms):.0f}/{MAX_SYSTEM_ENERGY}"
             )
 
             # Day-night bar (fit within typical terminal width)
