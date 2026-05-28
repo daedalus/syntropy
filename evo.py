@@ -432,6 +432,22 @@ class World:
                 sparkline += SPARK[idx]
             lines.append(f"  └{'─' * min(50, len(window))}  {sparkline}")
 
+        # Gene frequency bars (compact histogram per gene)
+        if self.organisms:
+            labels = ["spd", "sen", "agg", "met", "wnd", "hue"]
+            bar_parts = []
+            for i, (label, (_, g_min, g_max)) in enumerate(zip(labels, GENES)):
+                counts = [0] * (g_max - g_min + 1)
+                for o in self.organisms:
+                    counts[o.genome[i]] += 1
+                max_c = max(counts) if max(counts) > 0 else 1
+                bars = "".join(
+                    " ▁▂▃▄▅▆▇█"[min(7, int(c / max_c * 7))]
+                    for c in counts
+                )
+                bar_parts.append(f"{label} {bars}")
+            lines.append("  " + "  ".join(bar_parts))
+
         # Dominant genome line
         if dominant_key:
             genome_str = " ".join(str(g) for g in dominant_key)
