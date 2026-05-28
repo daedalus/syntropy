@@ -22,6 +22,7 @@ SEED = 42
 EXTINCTION_LOG_FILE = "extinction.json"
 SOUND_ENABLED = True
 SOUND_VOLUME = 0.3
+SHARED_MEM_ENABLED = False   # experimental: shared memory + symbolic signals (opt-in)
 
 WIDTH = 72
 HEIGHT = 26
@@ -621,7 +622,7 @@ class World:
         self.territory: Dict[Tuple[int, int], Dict[int, int]] = {}
         self.traces: Dict[Tuple[int, int], float] = {}
         self.signal_buffers: Dict[Tuple[int, int], List[float]] = {}
-        self.shared_mem: List[float] = [0.0] * 64          # world-wide shared memory
+        self.shared_mem: Optional[List[float]] = [0.0] * 64 if SHARED_MEM_ENABLED else None
         self.symbol_buffers: Dict[Tuple[int, int], Dict[int, float]] = {}  # typed symbol channel
         self.death_stats: Dict[str, int] = {
             "starvation": 0, "predation": 0, "fighting": 0,
@@ -835,7 +836,7 @@ class World:
         sig = self.signal_buffers.get((org.x, org.y), 0.0)
         senses[Sensor.SIGNAL] = min(1.0, sig / 10.0)
         # Symbol sensors — typed symbol channel (SYMEMIT)
-        sym_dict = self.symbol_buffers.get((org.x, org.y), {})
+        sym_dict = self.symbol_buffers.get((org.x, org.y), {}) if SHARED_MEM_ENABLED else {}
         if sym_dict:
             best_sym = max(sym_dict, key=lambda s: abs(sym_dict[s]))
             senses[Sensor.SYMBOL_ID] = float(best_sym) / 63.0
@@ -1008,7 +1009,7 @@ class World:
                     tx, ty = _wx(org.x + dx), _wy(org.y + dy)
                     self.signal_buffers[(tx, ty)] = self.signal_buffers.get((tx, ty), 0.0) + abs(val)
 
-        elif action_id == Action.SYMEMIT:
+        elif action_id == Action.SYMEMIT and SHARED_MEM_ENABLED:
             # upper 2 bits of _arg index the symbol-id register; lower 2 bits index the value register
             sym_reg = (_arg >> 2) % NUM_REGS
             val_reg = _arg % NUM_REGS
@@ -1401,17 +1402,18 @@ class World:
                 dec_sig[pos] = v
         self.signal_buffers = dec_sig
 
-        # Symbol buffer decay
-        dec_sym: Dict[Tuple[int, int], Dict[int, float]] = {}
-        for pos, sym_dict in self.symbol_buffers.items():
-            new_d = {s: v * 0.85 for s, v in sym_dict.items() if abs(v * 0.85) > 0.01}
-            if new_d:
-                dec_sym[pos] = new_d
-        self.symbol_buffers = dec_sym
+        if SHARED_MEM_ENABLED:
+            # Symbol buffer decay
+            dec_sym: Dict[Tuple[int, int], Dict[int, float]] = {}
+            for pos, sym_dict in self.symbol_buffers.items():
+                new_d = {s: v * 0.85 for s, v in sym_dict.items() if abs(v * 0.85) > 0.01}
+                if new_d:
+                    dec_sym[pos] = new_d
+            self.symbol_buffers = dec_sym
 
-        # Shared memory slow decay (values persist unless overwritten or allowed to fade)
-        for i in range(len(self.shared_mem)):
-            self.shared_mem[i] *= 0.998
+            # Shared memory slow decay (values persist unless overwritten or allowed to fade)
+            for i in range(len(self.shared_mem)):
+                self.shared_mem[i] *= 0.998
 
         # Corpse resources
         for o in dead_list:
@@ -1627,8 +1629,8 @@ class World:
                 f"Gen:{max_g:3d}  Age:{avg_age:.1f}  "
                 f"Sp:{sp:2d}  H\u2019:{shannon:.2f}  Fos:{self.fossil_count:4d}  "
                 f"Res:{len(self.resources):3d}  "
-                f"Shm:{sum(1 for v in self.shared_mem if abs(v) > 0.01):2d}  "
-                f"{'☀ sum' if self.season == 'summer' else '\u2744 win'}  "
+                + (f"Shm:{sum(1 for v in self.shared_mem if abs(v) > 0.01):2d}  " if SHARED_MEM_ENABLED else "")
+                + f"{'☀ sum' if self.season == 'summer' else '\u2744 win'}  "
                 f"T:{self.tick}  tot:{sum(o.energy+o.fat for o in self.organisms):.0f}/{MAX_SYSTEM_ENERGY:.0f}"
             )
 
@@ -1715,7 +1717,7 @@ class World:
 
 
 async def main():
-    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY, MAX_MOVEMENT_SPEED
+    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY, MAX_MOVEMENT_SPEED, SHARED_MEM_ENABLED
     parser = argparse.ArgumentParser(description="VM-genome evolutionary ecosystem")
     parser.add_argument("--volume", type=float, default=SOUND_VOLUME)
     parser.add_argument("--no-sound", action="store_true")
@@ -1728,9 +1730,13 @@ async def main():
     parser.add_argument("--max-movement-speed", type=int, default=0,
                     help="max movement actions per tick per organism (0=unlimited)")
     parser.add_argument("--continuous", action="store_true")
+    parser.add_argument("--shared-memory", action="store_true",
+                    help="enable experimental shared memory and symbolic signal features (GLOAD/GSTORE/SYMEMIT)")
     args = parser.parse_args()
     if args.no_sound:
         SOUND_ENABLED = False
+    if args.shared_memory:
+        SHARED_MEM_ENABLED = True
     SOUND_VOLUME = max(0.0, min(1.0, args.volume))
     TICK_RATE = max(0.01, args.tick_rate)
     EXTINCTION_LOG_FILE = args.log
