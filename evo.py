@@ -1351,7 +1351,8 @@ class World:
                 f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  Age:{avg_age:.1f}  "
                 f"Sp:{sp:2d}  H\u2019:{shannon:.2f}  Fos:{self.fossil_count:4d}  "
                 f"Res:{len(self.resources):3d}  "
-                f"{'☀ sum' if self.season == 'summer' else '\u2744 win'}  T:{self.tick}"
+                f"{'☀ sum' if self.season == 'summer' else '\u2744 win'}  "
+                f"T:{self.tick}  max_age:{max(o.age for o in self.organisms):.0f}"
             )
 
             # Day-night bar (fit within typical terminal width)
@@ -1470,7 +1471,9 @@ async def main():
         try:
             while world.organisms:
                 sys.stdout.write("\033[H")
-                sys.stdout.write(world.render())
+                for line in world.render().split("\n"):
+                    sys.stdout.write(line + "\033[K\n")
+                sys.stdout.write("\033[J")
                 sys.stdout.flush()
                 await world.step()
                 await asyncio.sleep(TICK_RATE)
@@ -1490,6 +1493,10 @@ async def main():
               f"Generations: {world.max_gen_ever}  "
               f"Max age: {world.max_age_ever}  "
               f"Min pop: {world.min_pop_ever}")
+        ds = world.death_stats
+        total_d = sum(ds.values()) or 1
+        causes = "  ".join(f"{k}:{v} ({v*100//total_d}%)" for k, v in ds.items())
+        print(f"  Deaths: {causes}")
         print(f"  Species now: {len({tuple(o.genome) for o in world.organisms})}  "
               f"Infected: {len(world.diseased)}  "
               f"Fossil lineages: {world.fossil_count}")
