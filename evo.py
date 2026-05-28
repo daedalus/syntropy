@@ -87,6 +87,7 @@ class Organism:
     age: int
     generation: int
     id: int
+    fat: float = 0.0
 
 
 class World:
@@ -376,8 +377,16 @@ class World:
                         prey_hue = other.genome[5]
                         prey_y_zone = int(5 * (1.0 - other.y / (HEIGHT - 1)))
                         camo = 1.0 - abs(prey_hue - prey_y_zone) / 5.0
+                        # Herding defense: nearby prey protect each other
+                        herd_count = 0
+                        for herdmate in self.organisms:
+                            if herdmate is other or herdmate.id in dead or herdmate.genome[8] >= 1:
+                                continue
+                            if abs(herdmate.x - other.x) <= 2 and abs(herdmate.y - other.y) <= 2:
+                                herd_count += 1
+                        herd_bonus = 1.0 + herd_count * 0.15
                         org_power = max(0.1, org.energy) * (a + 1) / 4 * atk_mult
-                        other_power = max(0.1, other.energy) * (b + 1) / 4 * (1.0 + camo * 0.5)
+                        other_power = max(0.1, other.energy) * (b + 1) / 4 * (1.0 + camo * 0.5) * herd_bonus
                         total = org_power + other_power
                         if random.random() < org_power / total:
                             gain = other.energy * 0.6
@@ -418,6 +427,17 @@ class World:
 
             if org.id in dead:
                 continue
+
+            # --- FAT METABOLISM: store excess energy, draw during scarcity ---
+            fat_cap = 1.0 + org.genome[3] * 1.5
+            if org.energy > 2.0 and org.fat < fat_cap:
+                store = min(org.energy - 2.0, fat_cap - org.fat, 0.5)
+                org.fat += store
+                org.energy -= store
+            elif org.energy < 0.5 and org.fat > 0:
+                draw = min(org.fat, 1.0)
+                org.fat -= draw
+                org.energy += draw * 0.7
 
             # --- STARVATION ---
             if org.energy <= 0:
@@ -704,6 +724,8 @@ class World:
                     grid[org.y][org.x] = f"{BOLD}\033[47m\033[30m{glyph}{RESET}"
                 elif org.id in self.diseased:
                     grid[org.y][org.x] = f"{BOLD}\033[41m{color}{glyph}{RESET}"
+                elif org.fat > 1.5:
+                    grid[org.y][org.x] = f"{BOLD}\033[43m{color}{glyph}{RESET}"
                 elif org.genome[9] > 0:
                     grid[org.y][org.x] = f"{BOLD}\033[45m{color}{glyph}{RESET}"
                 elif org.energy > 7:
@@ -732,6 +754,10 @@ class World:
             avg_tmp = sum(o.genome[7] for o in self.organisms) / n
             avg_diet = sum(o.genome[8] for o in self.organisms) / n
             avg_tox = sum(o.genome[9] for o in self.organisms) / n
+            avg_fat = sum(o.fat for o in self.organisms) / n
+            n_herb = sum(1 for o in self.organisms if o.genome[8] == 0)
+            n_carn = sum(1 for o in self.organisms if o.genome[8] == 1)
+            n_omni = sum(1 for o in self.organisms if o.genome[8] == 2)
             species = len({tuple(o.genome) for o in self.organisms})
 
             # Dominant genome
@@ -743,16 +769,19 @@ class World:
             dominant_pct = genome_counts.get(dominant_key, 0) / n * 100
             dominant_glyph = GLYPH_SET[dominant_key[5] % len(GLYPH_SET)] if dominant_key else "?"
         else:
-            avg_e = max_g = avg_spd = avg_agg = avg_met = avg_mut = avg_tmp = avg_diet = avg_tox = species = n = 0
+            avg_e = max_g = avg_spd = avg_agg = avg_met = avg_mut = avg_tmp = avg_diet = avg_tox = avg_fat = species = n = 0
+            n_herb = n_carn = n_omni = 0
             dominant_key = ()
             dominant_pct = 0
             dominant_glyph = "?"
 
         lines.append(
             f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  "
-            f"Sp:{species:2d}  Fos:{self.fossil_count:4d}  Spd:{avg_spd:.1f}  "
+            f"Sp:{species:2d}  Fos:{self.fossil_count:4d}  "
+            f"H:{n_herb} C:{n_carn} O:{n_omni}  Spd:{avg_spd:.1f}  "
             f"Agg:{avg_agg:.1f}  Met:{avg_met:.1f}  "
             f"μMut:{avg_mut:.1f}  Tm:{avg_tmp:.1f}  D:{avg_diet:.1f}  Tx:{avg_tox:.1f}  "
+            f"Ft:{avg_fat:.2f}  "
             f"Res:{len(self.resources):3d}  Inf:{len(self.diseased):2d}  "
             f"{'☀' if self.season == 'summer' else '❄'}{'S' if self.season == 'summer' else 'W'}  T:{self.tick}"
         )
