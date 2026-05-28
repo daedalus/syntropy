@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+extinction.csv
+extinction.json
