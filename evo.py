@@ -20,6 +20,7 @@ random.seed()
 
 EXTINCTION_LOG_FILE = "extinction.csv"
 SOUND_ENABLED = True
+SOUND_VOLUME = 0.3
 
 # --- CONFIG ---
 WIDTH = 64
@@ -174,8 +175,9 @@ class World:
             return
         tone = self.SOUND_TONES.get(event_type)
         if tone:
+            freq, dur = tone
             threading.Thread(
-                target=World._play_tone, args=tone, daemon=True
+                target=World._play_tone, args=(freq, dur, SOUND_VOLUME), daemon=True
             ).start()
 
     def _log_extinction(self, etype: str, pop: int):
