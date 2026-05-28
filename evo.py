@@ -20,6 +20,11 @@ HEIGHT = 22
 INITIAL_ORGANISMS = 40
 INITIAL_RESOURCES = 80
 RESOURCE_REGEN = 4
+SEASON_LENGTH = (70, 110)
+SUMMER_REGEN = 6
+WINTER_REGEN = 2
+SUMMER_BASE_COST = 0.03
+WINTER_BASE_COST = 0.08
 REPRODUCTION_THRESHOLD = 5.0
 SEXUAL_THRESHOLD = 3.0
 ENERGY_COST_PER_CHILD = 2.5
@@ -38,7 +43,7 @@ RESOURCE_TYPES = {
 RESOURCE_KEYS = list(RESOURCE_TYPES.keys())
 
 # Mutation rate per gene value (0=low mut, 5=high mut)
-MUT_RATES = [0.02, 0.05, 0.08, 0.12, 0.18, 0.28]
+MUT_RATES = [0.05, 0.08, 0.12, 0.16, 0.22, 0.30]
 
 GENES = [
     ("speed", 0, 3),
@@ -91,6 +96,8 @@ class World:
         self.genes_lost: List[str] = []
         self.migration_timer = random.randint(*MIGRATION_INTERVAL)
         self.fossil_lineages: List[Tuple[int, ...]] = []
+        self.season = "summer"
+        self.season_timer = random.randint(*SEASON_LENGTH)
 
         for _ in range(INITIAL_RESOURCES):
             rtype = random.choices(RESOURCE_KEYS, weights=[t["weight"] for t in RESOURCE_TYPES.values()])[0]
@@ -158,6 +165,14 @@ class World:
             self._shift_environment()
             self.shift_timer = random.randint(*ENV_SHIFT_INTERVAL)
 
+        self.season_timer -= 1
+        if self.season_timer <= 0:
+            self.season = "winter" if self.season == "summer" else "summer"
+            self.season_timer = random.randint(*SEASON_LENGTH)
+            self.events.append(
+                f"🌤️ Season: {'☀ summer' if self.season == 'summer' else '❄ winter'}"
+            )
+
         dead: Set[int] = set()
 
         random.shuffle(self.organisms)
@@ -212,7 +227,8 @@ class World:
                 org.energy += base_val * met_bonus
 
             # --- METABOLIC COST ---
-            base_cost = 0.05 + org.genome[3] * 0.15
+            base_cost = SUMMER_BASE_COST if self.season == "summer" else WINTER_BASE_COST
+            base_cost += org.genome[3] * 0.15
             speed_cost = org.genome[0] * 0.02
             sense_cost = org.genome[1] * 0.025
             agg_cost = org.genome[2] * 0.015
@@ -393,7 +409,8 @@ class World:
             self.migration_timer = random.randint(*MIGRATION_INTERVAL)
 
         # --- REGENERATE RESOURCES ---
-        for _ in range(RESOURCE_REGEN):
+        regen = SUMMER_REGEN if self.season == "summer" else WINTER_REGEN
+        for _ in range(regen):
             if len(self.resources) < WIDTH * HEIGHT * 0.25:
                 x, y = random.randint(0, WIDTH - 1), random.randint(0, HEIGHT - 1)
                 if (x, y) not in self.resources:
@@ -503,7 +520,8 @@ class World:
             f"Sp:{species:2d}  Speed:{avg_spd:.1f}  "
             f"Agg:{avg_agg:.1f}  Met:{avg_met:.1f}  "
             f"μMut:{avg_mut:.1f}  "
-            f"Res:{len(self.resources):3d}  MaxAge:{self.max_age_ever:3d}  T:{self.tick}"
+            f"Res:{len(self.resources):3d}  MaxAge:{self.max_age_ever:3d}  "
+            f"{'☀' if self.season == 'summer' else '❄'}{'S' if self.season == 'summer' else 'W'}  T:{self.tick}"
         )
 
         # Population sparkline (compact)
