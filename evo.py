@@ -38,6 +38,7 @@ ENERGY_COST_PER_CHILD = 3.0
 ENV_SHIFT_INTERVAL = (30, 60)
 DAY_LENGTH = 120
 MAX_SYSTEM_ENERGY = 200
+MAX_MOVEMENT_SPEED = 0
 MIGRATION_INTERVAL = (80, 150)
 MIGRATION_BATCH = (3, 8)
 TICK_RATE = 0.06
@@ -1055,8 +1056,15 @@ class World:
 
             # Apply VM actions
             if not torpid and not asleep:
+                moved_n = 0
                 for act_id, arg, _intensity in actions:
+                    is_move = act_id in (Action.MOVE_N, Action.MOVE_S, Action.MOVE_E,
+                                         Action.MOVE_W, Action.MOVE_TOWARD_FOOD, Action.MOVE_AWAY_ORG)
+                    if is_move and MAX_MOVEMENT_SPEED > 0 and moved_n >= MAX_MOVEMENT_SPEED:
+                        continue
                     self.apply_action(org, act_id, arg)
+                    if is_move:
+                        moved_n += 1
 
             # Decay and update action counts for trait evaluation
             decayed = {}
@@ -1580,6 +1588,8 @@ async def main():
     parser.add_argument("--width", type=int, default=WIDTH)
     parser.add_argument("--height", type=int, default=HEIGHT)
     parser.add_argument("--max-energy", type=float, default=None)
+    parser.add_argument("--max-movement-speed", type=int, default=0,
+                    help="max movement actions per tick per organism (0=unlimited)")
     parser.add_argument("--continuous", action="store_true")
     args = parser.parse_args()
     if args.no_sound:
@@ -1592,6 +1602,8 @@ async def main():
     HEIGHT = max(8, min(64, args.height))
     if args.max_energy is not None:
         MAX_SYSTEM_ENERGY = max(10, args.max_energy)
+    if args.max_movement_speed > 0:
+        MAX_MOVEMENT_SPEED = args.max_movement_speed
     continuous = args.continuous
 
     run_count = 0
