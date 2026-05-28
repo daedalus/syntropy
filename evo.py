@@ -26,15 +26,15 @@ SOUND_VOLUME = 0.3
 WIDTH = 72
 HEIGHT = 26
 INITIAL_ORGANISMS = 40
-INITIAL_RESOURCES = 100
-RESOURCE_REGEN = 5
-SEASON_LENGTH = (70, 110)
-SUMMER_REGEN = 6
-WINTER_REGEN = 2
-SUMMER_BASE_COST = 0.03
-WINTER_BASE_COST = 0.08
-REPRODUCTION_THRESHOLD = 5.0
-ENERGY_COST_PER_CHILD = 2.5
+INITIAL_RESOURCES = 60
+RESOURCE_REGEN = 3
+SEASON_LENGTH = (50, 80)
+SUMMER_REGEN = 4
+WINTER_REGEN = 1
+SUMMER_BASE_COST = 0.06
+WINTER_BASE_COST = 0.12
+REPRODUCTION_THRESHOLD = 6.0
+ENERGY_COST_PER_CHILD = 3.0
 ENV_SHIFT_INTERVAL = (30, 60)
 DAY_LENGTH = 120
 MIGRATION_INTERVAL = (80, 150)
@@ -68,6 +68,7 @@ class Sensor:
     PRESSURE, SEASON, LATITUDE = 12, 13, 14
     FAT, HEALTH = 15, 16
     ACT_EAT, ACT_ATTACK = 17, 18
+    TRACE = 19
 
 class Action:
     MOVE_N, MOVE_S, MOVE_E, MOVE_W = 0, 1, 2, 3
@@ -77,7 +78,7 @@ class Action:
     TOTAL = 11
 
 NUM_REGS = 4
-NUM_SENSORS = 19
+NUM_SENSORS = 20
 NUM_ACTIONS = 11
 
 
@@ -427,16 +428,15 @@ class Organism:
 
 
 def _tdist(a: int, b: int, size: int) -> int:
-    d = abs(a - b)
-    return min(d, size - d)
+    return abs(a - b)
 
 
 def _wx(x: int) -> int:
-    return x % WIDTH if WIDTH else 0
+    return max(0, min(WIDTH - 1, x)) if WIDTH else 0
 
 
 def _wy(y: int) -> int:
-    return y % HEIGHT if HEIGHT else 0
+    return max(0, min(HEIGHT - 1, y)) if HEIGHT else 0
 
 
 _next_id = 0
@@ -486,6 +486,7 @@ class World:
         self.immune: Set[int] = set()
         self.nests: Dict[Tuple[int, int], int] = {}
         self.territory: Dict[Tuple[int, int], Dict[int, int]] = {}
+        self.traces: Dict[Tuple[int, int], float] = {}
         self.death_stats: Dict[str, int] = {
             "starvation": 0, "predation": 0, "fighting": 0,
             "old_age": 0, "disease": 0, "unknown": 0,
@@ -662,6 +663,18 @@ class World:
         senses[Sensor.HEALTH] = min(1.0, org.energy / 5.0)
         senses[Sensor.ACT_EAT] = org.action_counts.get(Action.EAT, 0)
         senses[Sensor.ACT_ATTACK] = org.action_counts.get(Action.ATTACK, 0)
+
+        # Trace sensor — max trace strength within radius 3
+        best_trace = 0.0
+        ox, oy = org.x, org.y
+        for dx in range(-3, 4):
+            for dy in range(-3, 4):
+                tx, ty = ox + dx, oy + dy
+                if 0 <= tx < WIDTH and 0 <= ty < HEIGHT:
+                    s = self.traces.get((tx, ty), 0.0)
+                    if s > best_trace:
+                        best_trace = s
+        senses[Sensor.TRACE] = min(1.0, best_trace / 5.0)
         return senses
 
     def apply_action(self, org: Organism, action_id: int, _arg: int):
@@ -735,7 +748,7 @@ class World:
                     break
 
         elif action_id == Action.REPRODUCE:
-            if org.energy < 3.0:
+            if org.energy < ENERGY_COST_PER_CHILD * 0.6:
                 return
             neighbors = []
             for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
@@ -759,23 +772,19 @@ class World:
                     break
 
             if mate:
-                # Sexual reproduction — crossover genomes
-                child_vm = org.vm.crossover(mate.vm)
-                child_vm = child_vm.clone_mutated()
-                cost = ENERGY_COST_PER_CHILD * 0.7
+                cost = ENERGY_COST_PER_CHILD * 0.6
                 org.energy -= cost
                 mate.energy -= cost * 0.5
-                child = self._spawn(nx, ny, child_vm.genome,
-                                    energy=(org.energy + mate.energy) * 0.15,
-                                    generation=child_g)
-                org.energy -= child.energy * 0.5
+                child_vm = org.vm.crossover(mate.vm)
+                child_vm = child_vm.clone_mutated()
+                self._spawn(nx, ny, child_vm.genome,
+                            energy=2.5, generation=child_g)
             else:
-                # Asexual reproduction — clone with mutations
+                cost = ENERGY_COST_PER_CHILD * 0.6
+                org.energy -= cost
                 child_vm = org.vm.clone_mutated()
-                child = self._spawn(nx, ny, child_vm.genome,
-                                    energy=org.energy * 0.4,
-                                    generation=child_g)
-                org.energy *= 0.6
+                self._spawn(nx, ny, child_vm.genome,
+                            energy=2.0, generation=child_g)
                 if child_g > self.max_gen_ever:
                     self.max_gen_ever = child_g
                     self.events.append(f"Gen {child_g} reached!")
@@ -938,7 +947,7 @@ class World:
                 for act_id, _ in actions:
                     org.action_counts[act_id] = org.action_counts.get(act_id, 0) + 1.0
 
-            # Random wander if no directed movement
+            # Genome-determined drift when VM produces no movement actions
             if not torpid and not asleep:
                 speed = 1 + (org.vm.instr_count // 10)
                 moved = any(
@@ -947,9 +956,11 @@ class World:
                     for a in actions
                 )
                 if not moved:
+                    dx = (org.genome[0] % 3) - 1 if org.genome else 0
+                    dy = (org.genome[min(1, len(org.genome)-1)] % 3) - 1 if len(org.genome) > 1 else 0
                     for _ in range(speed):
-                        org.x = _wx(org.x + random.choice([-1, 0, 1]))
-                        org.y = _wy(org.y + random.choice([-1, 0, 1]))
+                        org.x = _wx(org.x + dx)
+                        org.y = _wy(org.y + dy)
 
             # Nest building
             if not torpid and not asleep and org.energy > 3.0:
@@ -1008,20 +1019,13 @@ class World:
             if org.id in dead:
                 continue
 
-            # Eat if standing on food (automatic, not just from ACT)
+            # Weak auto-eat at 30% efficiency (bootstrap only)
             if not torpid:
                 pos = (org.x, org.y)
                 if pos in self.resources:
                     rtype = self.resources.pop(pos)
-                    base_val = RESOURCE_TYPES[rtype]["value"]
-                    age_bonus = min(org.age, 30) / 30.0 * 0.3
-                    org.energy += base_val * (1.0 + age_bonus)
-                    fert = self.soil_fertility.get(pos, 0.0)
-                    if fert > 0 and rtype in ("food", "bounty"):
-                        org.energy += fert * 0.2
-                        self.soil_fertility[pos] = max(0.0, fert - 0.05)
-                    if rtype in ("food", "bounty"):
-                        self.soil_fertility[pos] = self.soil_fertility.get(pos, 0.0) + 0.1
+                    age_bonus = min(org.age, 20) / 20.0 * 0.2
+                    org.energy += RESOURCE_TYPES[rtype]["value"] * (0.3 + age_bonus)
 
             # Metabolic cost
             base_cost = SUMMER_BASE_COST if self.season == "summer" else WINTER_BASE_COST
@@ -1100,28 +1104,17 @@ class World:
             if is_elder:
                 repro_thresh *= 0.8
             if org.energy >= repro_thresh:
-                for act_id, _ in actions:
-                    if act_id == Action.REPRODUCE:
-                        break
-                else:
-                    # Auto-reproduce at threshold
-                    neighbors = []
-                    for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                        nx, ny = _wx(org.x + dx), _wy(org.y + dy)
-                        if not any(o.x == nx and o.y == ny for o in self.organisms):
-                            neighbors.append((nx, ny))
-                    if neighbors:
-                        nx, ny = random.choice(neighbors)
-                        child_g = org.generation + 1
-                        child_vm = org.vm.clone_mutated()
-                        self._spawn(nx, ny, child_vm.genome,
-                                    energy=ENERGY_COST_PER_CHILD,
-                                    generation=child_g)
-                        org.energy -= ENERGY_COST_PER_CHILD
-                        if child_g > self.max_gen_ever:
-                            self.max_gen_ever = child_g
-                            self.events.append(f"Gen {child_g} reached!")
-                            self._sound("new_gen")
+                vm_repro = any(act_id == Action.REPRODUCE for act_id, _ in actions)
+                # Weak auto-reproduce fallback when far above threshold
+                if not vm_repro and org.energy >= repro_thresh * 2.0 and random.random() < 0.10:
+                    self.apply_action(org, Action.REPRODUCE, 0)
+
+            # Mutation pressure from reproduction overhead
+            if org.energy >= repro_thresh * 1.5 and random.random() < 0.03:
+                if len(org.vm.genome) < 600 and random.random() < 0.5:
+                    idx = (random.randrange(0, len(org.vm.genome) + 1) // 3) * 3
+                    org.vm.genome[idx:idx] = [random.randint(0, Op.TOTAL - 1),
+                                              random.randint(0, 255), random.randint(0, 255)]
 
         # Remove dead
         pop_before = len(self.organisms)
@@ -1140,6 +1133,16 @@ class World:
         pop_after = len(self.organisms)
         died = pop_before - pop_after
         self.diseased &= {o.id for o in self.organisms}
+
+        # Trace deposit and decay
+        for o in self.organisms:
+            self.traces[(o.x, o.y)] = self.traces.get((o.x, o.y), 0.0) + 0.5
+        decayed = {}
+        for pos, strength in self.traces.items():
+            s = strength * 0.95
+            if s > 0.01:
+                decayed[pos] = s
+        self.traces = decayed
 
         # Corpse resources
         for o in dead_list:
