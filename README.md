@@ -3,6 +3,8 @@
 Digital organisms run Turing-complete VM programs (46 opcodes) on a shared 2D grid.
 No fitness function. No selection pressure. No objective. Evolution emerges bottom-up.
 
+![syntropy screenshot](image.png)
+
 ## Run
 
 ```bash
