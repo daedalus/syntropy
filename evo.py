@@ -70,6 +70,7 @@ class Sensor:
     FAT, HEALTH = 15, 16
     ACT_EAT, ACT_ATTACK = 17, 18
     TRACE = 19
+    TRACE_DX, TRACE_DY = 20, 21
 
 class Action:
     MOVE_N, MOVE_S, MOVE_E, MOVE_W = 0, 1, 2, 3
@@ -79,7 +80,7 @@ class Action:
     TOTAL = 11
 
 NUM_REGS = 4
-NUM_SENSORS = 20
+NUM_SENSORS = 22
 NUM_ACTIONS = 11
 
 
@@ -667,9 +668,10 @@ class World:
         senses[Sensor.ACT_EAT] = org.action_counts.get(Action.EAT, 0)
         senses[Sensor.ACT_ATTACK] = org.action_counts.get(Action.ATTACK, 0)
 
-        # Trace sensor — max trace strength within radius 3
+        # Trace sensors — strength and direction toward nearest trace
         best_trace = 0.0
         ox, oy = org.x, org.y
+        best_tx, best_ty = ox, oy
         for dx in range(-3, 4):
             for dy in range(-3, 4):
                 tx, ty = ox + dx, oy + dy
@@ -677,7 +679,14 @@ class World:
                     s = self.traces.get((tx, ty), 0.0)
                     if s > best_trace:
                         best_trace = s
+                        best_tx, best_ty = tx, ty
         senses[Sensor.TRACE] = min(1.0, best_trace / 5.0)
+        if best_trace > 0:
+            senses[Sensor.TRACE_DX] = max(-1.0, min(1.0, (best_tx - ox) / 3.0))
+            senses[Sensor.TRACE_DY] = max(-1.0, min(1.0, (best_ty - oy) / 3.0))
+        else:
+            senses[Sensor.TRACE_DX] = 0.0
+            senses[Sensor.TRACE_DY] = 0.0
         return senses
 
     def apply_action(self, org: Organism, action_id: int, _arg: int):
