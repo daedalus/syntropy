@@ -59,7 +59,10 @@ class Op:
     MOD, CMP = 19, 20
     AND, OR, XOR, NOT = 21, 22, 23, 24
     IND = 25
-    TOTAL = 26
+    MIN, MAX = 26, 27
+    ABS, NEG = 28, 29
+    DUP, JNE = 30, 31
+    TOTAL = 32
 
 class Sensor:
     FOOD_X, FOOD_Y, FOOD_DIST = 0, 1, 2
@@ -235,6 +238,20 @@ class GenomeVM:
                 self._sr(ridx, float(~int(rv)))
             elif op == Op.IND:
                 self._sr(ridx, self._rg(int(v) % NUM_REGS))
+            elif op == Op.MIN:
+                self._sr(ridx, min(rv, v))
+            elif op == Op.MAX:
+                self._sr(ridx, max(rv, v))
+            elif op == Op.ABS:
+                self._sr(ridx, abs(rv))
+            elif op == Op.NEG:
+                self._sr(ridx, -rv)
+            elif op == Op.DUP:
+                if self.stack:
+                    self.stack.append(self.stack[-1])
+            elif op == Op.JNE:
+                if abs(rv) >= 0.001:
+                    self.pc = (a2 % max(3, glen)) // 3 * 3
 
         return actions
 
@@ -1428,7 +1445,7 @@ class World:
             if sentinel and sentinel.generation > 0:
                 OP_NAMES = ["NOP","MOV","ADD","SUB","MUL","DIV","JMP","JZ","JG","JL",
                             "SENSE","ACT","PUSH","POP","CALL","RET","HALT","RAND","ENERGY",
-                            "MOD","CMP","AND","OR","XOR","NOT","IND"]
+                            "MOD","CMP","AND","OR","XOR","NOT","IND","MIN","MAX","ABS","NEG","DUP","JNE"]
                 g = sentinel.genome
                 decoded = []
                 for i in range(0, min(len(g), 54), 3):
