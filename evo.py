@@ -65,7 +65,9 @@ class Op:
     SWAP, GEN = 32, 33
     PICK, DEPTH = 34, 35
     PC, SETPC = 36, 37
-    TOTAL = 38
+    SQRT, EXP = 38, 39
+    TICK, DROP, OVER = 40, 41, 42
+    TOTAL = 43
 
 # Per-opcode instruction cost (budget consumed per execution)
 OP_COST = [
@@ -89,6 +91,8 @@ OP_COST = [
     0.008, 0.010,  # SWAP, GEN
     0.008, 0.006,  # PICK, DEPTH
     0.006, 0.008,  # PC, SETPC
+    0.014, 0.016,  # SQRT, EXP
+    0.004, 0.004, 0.006,  # TICK, DROP, OVER
 ]
 
 class Sensor:
@@ -174,7 +178,7 @@ class GenomeVM:
     def _val(self, v: int) -> float:
         return self._rg(v) if v < 64 else float(v) / 16.0
 
-    def execute(self, budget: float, senses: Dict[int, float]) -> List[Tuple[int, int]]:
+    def execute(self, budget: float, senses: Dict[int, float], tick: int = 0) -> List[Tuple[int, int]]:
         self.regs = [0.0] * NUM_REGS
         self.pc = 0
         self.stack = []
@@ -301,6 +305,18 @@ class GenomeVM:
             elif op == Op.SETPC:
                 new_pc = int(abs(rv))
                 self.pc = (new_pc % max(3, glen)) // 3 * 3
+            elif op == Op.SQRT:
+                self._sr(a2 % NUM_REGS, math.sqrt(max(0.0, rv)))
+            elif op == Op.EXP:
+                self._sr(a2 % NUM_REGS, math.exp(max(-10.0, min(10.0, rv))))
+            elif op == Op.TICK:
+                self._sr(a2 % NUM_REGS, float(tick))
+            elif op == Op.DROP:
+                if self.stack:
+                    self.stack.pop()
+            elif op == Op.OVER:
+                if len(self.stack) >= 2:
+                    self.stack.append(self.stack[-2])
 
         return actions
 
@@ -973,7 +989,7 @@ class World:
         async def _run_org(org) -> Tuple[Organism, List[Tuple[int, int]], Dict[int, float]]:
             senses = self.compute_senses(org)
             budget = min(org.energy * 0.4, 8.0)
-            actions = org.vm.execute(budget, senses)
+            actions = org.vm.execute(budget, senses, tick=self.tick)
             org.last_regs = org.vm.regs.copy()
             return (org, actions, senses)
 
@@ -1517,7 +1533,7 @@ class World:
                 OP_NAMES = ["NOP","MOV","ADD","SUB","MUL","DIV","JMP","JZ","JG","JL",
                             "SENSE","ACT","PUSH","POP","CALL","RET","HALT","RAND","ENERGY",
                             "MOD","CMP","AND","OR","XOR","NOT","IND","MIN","MAX","ABS","NEG","DUP","JNE",
-                            "SWAP","GEN","PICK","DPTH","PC","SETPC"]
+                            "SWAP","GEN","PICK","DPTH","PC","SETPC","SQRT","EXP","TICK","DROP","OVER"]
                 g = sentinel.genome
                 decoded = []
                 for i in range(0, min(len(g), 54), 3):
