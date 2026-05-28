@@ -1033,6 +1033,7 @@ class World:
             budget = min(org.energy * 0.4, 8.0)
             actions = org.vm.execute(budget, senses, tick=self.tick)
             org.last_regs = org.vm.regs.copy()
+            org.vm.genome = org.genome_a
             return (org, actions, senses)
 
         results = await asyncio.gather(*[_run_org(o) for o in self.organisms])
