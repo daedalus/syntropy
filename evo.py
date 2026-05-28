@@ -14,7 +14,6 @@ import struct
 import math
 import json
 import threading
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Set
@@ -237,13 +236,16 @@ class GenomeVM:
 
 # Audio mixer — per-organism stereo audio in background thread
 class AudioMixer:
+    SR = 22050
+
     def __init__(self):
         self.orgs: Dict[int, Tuple[float, float, float, float, float, float, float]] = {}
         self.ambient: Dict[str, Tuple[float, float, float, float, float, float, float]] = {}
+        self.stingers: Dict[str, Tuple[float, float, int, int]] = {}
         self.lock = threading.Lock()
-        self.running = True
-        self.thread = threading.Thread(target=self._mix_loop, daemon=True)
-        self.thread.start()
+        self._running = True
+        self._task = None
+        self._proc = None
 
     def set_org(self, oid: int, freq_bass: float, vol_bass: float,
                 freq_mid: float, vol_mid: float,
@@ -267,63 +269,122 @@ class AudioMixer:
             else:
                 self.ambient.pop(key, None)
 
+    def set_stinger(self, key: str, freq: float, vol: float, duration: float):
+        with self.lock:
+            samples = max(1, int(self.SR * duration))
+            self.stingers[key] = (freq, vol, samples, samples)
+
     def remove_org(self, oid: int):
         with self.lock:
             self.orgs.pop(oid, None)
 
-    def stop(self):
-        self.running = False
+    async def start(self):
+        if not SOUND_ENABLED:
+            return
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                "aplay", "-q", "-f", "S16_LE", "-r", str(self.SR), "-c", "2",
+                stdin=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+            )
+        except FileNotFoundError:
+            self._running = False
+            return
+        self._task = asyncio.create_task(self._mix_loop())
 
-    def _mix_loop(self):
-        sr = 22050
+    async def stop(self):
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        if self._proc and self._proc.stdin:
+            try:
+                self._proc.stdin.close()
+                await self._proc.wait()
+            except Exception:
+                pass
+
+    async def _mix_loop(self):
         buf_size = 512
         vol = SOUND_VOLUME * 0.15
-        while self.running:
+        phases: Dict[tuple, float] = {}
+
+        while self._running:
             with self.lock:
                 orgs = dict(self.orgs)
                 amb = dict(self.ambient)
-            n = len(orgs) + len(amb)
-            if n == 0:
-                time.sleep(0.05)
+                stings = dict(self.stingers)
+
+            total = len(orgs) + len(amb) + len(stings)
+            if total == 0:
+                await asyncio.sleep(0.05)
                 continue
+
             data = bytearray()
             for _ in range(buf_size):
-                t = time.time()
                 left = 0.0
                 right = 0.0
+
                 for oid, (fb, vb, fm, vm_, ft, vt_, _ts) in orgs.items():
                     spread = (oid % 100) / 100.0
                     l_gain = math.cos(spread * math.pi * 0.5)
                     r_gain = math.sin(spread * math.pi * 0.5)
-                    pb = 2 * math.pi * fb * t
-                    pm = 2 * math.pi * fm * t
-                    pt = 2 * math.pi * ft * t
-                    s = (math.sin(pb) * vb * 0.5 +
-                         math.sin(pm) * vm_ +
-                         math.sin(pt) * vt_ * 0.7) * vol
-                    left += s * l_gain
-                    right += s * r_gain
-                for _key, (fb, vb, fm, vm_, ft, vt_, _ts) in amb.items():
-                    pb = 2 * math.pi * fb * t
-                    pm = 2 * math.pi * fm * t
-                    pt = 2 * math.pi * ft * t
-                    s = (math.sin(pb) * vb * 0.5 +
-                         math.sin(pm) * vm_ +
-                         math.sin(pt) * vt_ * 0.7) * vol
-                    left += s * 0.5
-                    right += s * 0.5
+                    for bi, (f, bv) in enumerate([(fb, vb*0.5), (fm, vm_), (ft, vt_*0.7)]):
+                        if f < 1 or bv < 0.0001:
+                            continue
+                        pk = ('org', oid, bi)
+                        p = phases.get(pk, 0.0)
+                        p += 2 * math.pi * f / self.SR
+                        phases[pk] = p
+                        s = math.sin(p) * bv * vol
+                        left += s * l_gain
+                        right += s * r_gain
+
+                for key, (fb, vb, fm, vm_, ft, vt_, _ts) in amb.items():
+                    for bi, (f, bv) in enumerate([(fb, vb*0.5), (fm, vm_), (ft, vt_*0.7)]):
+                        if f < 1 or bv < 0.0001:
+                            continue
+                        pk = ('amb', key, bi)
+                        p = phases.get(pk, 0.0)
+                        p += 2 * math.pi * f / self.SR
+                        phases[pk] = p
+                        s = math.sin(p) * bv * vol * 0.5
+                        left += s
+                        right += s
+
+                expired = []
+                for skey, (f, sv, remain, total_s) in list(stings.items()):
+                    if remain <= 0:
+                        expired.append(skey)
+                        continue
+                    pk = ('st', skey, 0)
+                    p = phases.get(pk, 0.0)
+                    p += 2 * math.pi * f / self.SR
+                    phases[pk] = p
+                    env = remain / total_s
+                    s = math.sin(p) * sv * env * vol * 1.5
+                    left += s
+                    right += s
+                    stings[skey] = (f, sv, remain - 1, total_s)
+
+                with self.lock:
+                    for skey in expired:
+                        self.stingers.pop(skey, None)
+                        phases.pop(('st', skey, 0), None)
+
                 peak = max(abs(left), abs(right), 0.001)
                 scale = 16384 / peak
                 data.extend(struct.pack("<h", int(left * scale)))
                 data.extend(struct.pack("<h", int(right * scale)))
-            try:
-                proc = subprocess.Popen(
-                    ["aplay", "-q", "-f", "S16_LE", "-r", str(sr), "-c", "2"],
-                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
-                )
-                proc.communicate(input=bytes(data), timeout=1)
-            except Exception:
-                pass
+
+            if self._proc and self._proc.stdin:
+                try:
+                    self._proc.stdin.write(bytes(data))
+                    await asyncio.wait_for(self._proc.stdin.drain(), timeout=0.5)
+                except Exception:
+                    await asyncio.sleep(0.01)
 
 
 def _species_name(genome: tuple) -> str:
@@ -457,34 +518,13 @@ class World:
         "new_gen":      (880, 0.06),
     }
 
-    @staticmethod
-    def _play_tone(freq: float, duration: float, volume: float = 0.3):
-        sr = 22050
-        n = int(sr * duration)
-        data = bytearray()
-        for i in range(n):
-            t = i / sr
-            env = 1.0 - i / n if duration > 0.05 else 1.0
-            s = int(volume * env * 32767 * math.sin(2 * math.pi * freq * t))
-            data.extend(struct.pack("<h", s))
-        try:
-            proc = subprocess.Popen(
-                ["aplay", "-q", "-f", "S16_LE", "-r", str(sr), "-c", "1"],
-                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
-            )
-            proc.communicate(input=bytes(data), timeout=1)
-        except Exception:
-            pass
-
     def _sound(self, event_type: str):
         if not SOUND_ENABLED:
             return
         tone = self.SOUND_TONES.get(event_type)
         if tone:
             freq, dur = tone
-            threading.Thread(
-                target=World._play_tone, args=(freq, dur, SOUND_VOLUME), daemon=True
-            ).start()
+            self.mixer.set_stinger(event_type, freq, SOUND_VOLUME, dur)
 
     def _log_extinction(self, etype: str, pop: int):
         orgs = self.organisms
@@ -1367,6 +1407,7 @@ async def main():
 
         world = World()
         world.seed_used = SEED
+        await world.mixer.start()
         print("\033c", end="")
         interrupted = False
         try:
@@ -1379,7 +1420,7 @@ async def main():
         except KeyboardInterrupt:
             interrupted = True
 
-        world.mixer.stop()
+        await world.mixer.stop()
         total_extinct = 0
         print(f"\n{'═' * 40}")
         if not world.organisms:
