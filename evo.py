@@ -9,8 +9,6 @@ No stable equilibrium. Ever-evolving.
 
 import random
 import time
-import os
-import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Set
 
@@ -20,10 +18,10 @@ random.seed()
 WIDTH = 64
 HEIGHT = 22
 INITIAL_ORGANISMS = 40
-INITIAL_RESOURCES = 180
+INITIAL_RESOURCES = 100
 RESOURCE_REGEN = 5
 RESOURCE_VALUE = 2.5
-REPRODUCTION_THRESHOLD = 4.5
+REPRODUCTION_THRESHOLD = 5.0
 ENERGY_COST_PER_CHILD = 2.5
 MUTATION_RATE = 0.12
 ENV_SHIFT_INTERVAL = (30, 60)
@@ -73,6 +71,9 @@ class World:
         self.events: List[str] = []
         self.pop_history: List[int] = []
         self.max_gen_ever = 0
+        self.max_age_ever = 0
+        self.genes_found: List[Set[int]] = [set(range(g[1], g[2]+1)) for g in GENES]
+        self.genes_lost_last: List[int] = []
 
         for _ in range(INITIAL_RESOURCES):
             self._add_resource(
@@ -90,7 +91,7 @@ class World:
         self.resources[(x, y)] = RESOURCE_VALUE
 
     def _spawn(
-        self, x: int, y: int, genome: list, energy: float = 5.0, generation: int = 0
+        self, x: int, y: int, genome: list, energy: float = 3.0, generation: int = 0
     ):
         self.organisms.append(
             Organism(
@@ -264,6 +265,34 @@ class World:
         pop_after = len(self.organisms)
         died = pop_before - pop_after
 
+        # Track max age
+        for o in self.organisms:
+            if o.age > self.max_age_ever:
+                self.max_age_ever = o.age
+
+        # Gene loss detection
+        current_gene_vals = [set() for _ in GENES]
+        for o in self.organisms:
+            for i, v in enumerate(o.genome):
+                current_gene_vals[i].add(v)
+        lost_this_tick = []
+        for i, (expected, actual) in enumerate(zip(self.genes_found, current_gene_vals)):
+            lost = expected - actual
+            if lost:
+                lost_this_tick.append((i, lost))
+                self.genes_found[i] = current_gene_vals[i]
+        for gene_idx, lost_vals in lost_this_tick:
+            for v in lost_vals:
+                self.events.append(
+                    f"🧬 Extinct: {GENES[gene_idx][0]}={v} "
+                    f"(never again)"
+                )
+
+        # Record history
+        self.pop_history.append(pop_after)
+        if len(self.pop_history) > 60:
+            self.pop_history = self.pop_history[-60:]
+
         # Population crash event
         if died > 5 and pop_after > 0:
             self.events.append(f"💀 {died} died in a single tick")
@@ -314,7 +343,10 @@ class World:
 
         for (x, y), _ in self.resources.items():
             if 0 <= x < WIDTH and 0 <= y < HEIGHT:
-                grid[y][x] = f"{DIM}·{RESET}"
+                # Only draw if no organism is there (organisms drawn on top)
+                occupied = any(o.x == x and o.y == y for o in self.organisms)
+                if not occupied:
+                    grid[y][x] = "·"
 
         for org in self.organisms:
             if 0 <= org.x < WIDTH and 0 <= org.y < HEIGHT:
@@ -359,8 +391,21 @@ class World:
             f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  "
             f"Sp:{species:2d}  Speed:{avg_spd:.1f}  "
             f"Agg:{avg_agg:.1f}  Met:{avg_met:.1f}  "
-            f"Res:{len(self.resources):3d}  T:{self.tick}"
+            f"Res:{len(self.resources):3d}  MaxAge:{self.max_age_ever:3d}  T:{self.tick}"
         )
+
+        # Population sparkline (compact)
+        if self.pop_history:
+            max_pop = max(self.pop_history)
+            min_pop = min(self.pop_history)
+            span = max_pop - min_pop if max_pop > min_pop else 1
+            SPARK = "▁▂▃▄▅▆▇█"
+            sparkline = ""
+            window = self.pop_history[-min(60, len(self.pop_history)):]
+            for p in window:
+                idx = int((p - min_pop) / span * (len(SPARK) - 1))
+                sparkline += SPARK[idx]
+            lines.append(f"  └{'─' * min(50, len(window))}  {sparkline}")
 
         # Dominant genome line
         if dominant_key:
