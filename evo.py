@@ -53,9 +53,10 @@ GENES = [
     ("wander", 0, 3),
     ("hue", 0, 5),
     ("mut_rate", 0, 5),
+    ("thermal", 0, 4),
 ]
 
-GLYPH_SET = "●◆▲■★✦"
+GLYPH_SET = "●◆▲■★✦⬟⬢"
 COLORS = [
     "\033[31m",
     "\033[33m",
@@ -63,6 +64,8 @@ COLORS = [
     "\033[36m",
     "\033[34m",
     "\033[35m",
+    "\033[91m",
+    "\033[95m",
 ]
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -131,6 +134,14 @@ class World:
             )
         )
         self.next_id += 1
+
+    def _temperature_at(self, y: int) -> float:
+        t = 1.0 - y / (HEIGHT - 1)
+        if self.season == "summer":
+            t = min(1.0, t + 0.25)
+        else:
+            t = max(0.0, t - 0.25)
+        return t
 
     def _mutate(self, genome: list, mut_rate: float = BASE_MUTATION_RATE) -> list:
         new = list(genome)
@@ -233,7 +244,10 @@ class World:
             speed_cost = org.genome[0] * 0.02
             sense_cost = org.genome[1] * 0.025
             agg_cost = org.genome[2] * 0.015
-            org.energy -= base_cost + speed_cost + sense_cost + agg_cost
+            pref_temp = org.genome[7] / 4.0
+            actual_temp = self._temperature_at(org.y)
+            thermal_cost = abs(actual_temp - pref_temp) * 0.25
+            org.energy -= base_cost + speed_cost + sense_cost + agg_cost + thermal_cost
 
             # --- FIGHT (overlapping organisms) ---
             for other in self.organisms:
@@ -372,6 +386,8 @@ class World:
         self.organisms = kept
         pop_after = len(self.organisms)
         died = pop_before - pop_after
+        # Clean up diseased IDs for dead organisms
+        self.diseased &= {o.id for o in self.organisms}
         for o in dead_list:
             if random.random() < 0.5 and (o.x, o.y) not in self.resources:
                 bounty_val = min(2.5, 0.3 + o.energy * 0.3)
@@ -520,9 +536,12 @@ class World:
                 else:
                     grid[org.y][org.x] = f"{DIM}{color}{glyph}{RESET}"
 
+        TEMP_COLORS = ["\033[34m", "\033[32m", "\033[33m", "\033[31m"]
         lines = [f"{BOLD}╔{'═' * WIDTH}╗{RESET}"]
-        for row in grid:
-            lines.append(f"{BOLD}║{RESET}{''.join(row)}{BOLD}║{RESET}")
+        for y, row in enumerate(grid):
+            temp_idx = min(3, int((1.0 - y / (HEIGHT - 1)) * 4))
+            tc = TEMP_COLORS[temp_idx]
+            lines.append(f"{BOLD}{tc}║{RESET}{''.join(row)}{BOLD}{tc}║{RESET}")
         lines.append(f"{BOLD}╚{'═' * WIDTH}╝{RESET}")
 
         if self.organisms:
@@ -533,6 +552,7 @@ class World:
             avg_agg = sum(o.genome[2] for o in self.organisms) / n
             avg_met = sum(o.genome[3] for o in self.organisms) / n
             avg_mut = sum(o.genome[6] for o in self.organisms) / n
+            avg_tmp = sum(o.genome[7] for o in self.organisms) / n
             species = len({tuple(o.genome) for o in self.organisms})
 
             # Dominant genome
@@ -544,16 +564,16 @@ class World:
             dominant_pct = genome_counts.get(dominant_key, 0) / n * 100
             dominant_glyph = GLYPH_SET[dominant_key[5] % len(GLYPH_SET)] if dominant_key else "?"
         else:
-            avg_e = max_g = avg_spd = avg_agg = avg_met = species = n = 0
+            avg_e = max_g = avg_spd = avg_agg = avg_met = avg_mut = avg_tmp = species = n = 0
             dominant_key = ()
             dominant_pct = 0
             dominant_glyph = "?"
 
         lines.append(
             f"  Pop:{n:4d}  ⚡:{avg_e:.1f}  Gen:{max_g:3d}  "
-            f"Sp:{species:2d}  Speed:{avg_spd:.1f}  "
+            f"Sp:{species:2d}  Spd:{avg_spd:.1f}  "
             f"Agg:{avg_agg:.1f}  Met:{avg_met:.1f}  "
-            f"μMut:{avg_mut:.1f}  "
+            f"μMut:{avg_mut:.1f}  Tmp:{avg_tmp:.1f}  "
             f"Res:{len(self.resources):3d}  Inf:{len(self.diseased):2d}  "
             f"{'☀' if self.season == 'summer' else '❄'}{'S' if self.season == 'summer' else 'W'}  T:{self.tick}"
         )
@@ -584,7 +604,7 @@ class World:
 
         # Gene frequency bars (compact histogram per gene)
         if self.organisms:
-            labels = ["spd", "sen", "agg", "met", "wnd", "hue", "mut"]
+            labels = ["spd", "sen", "agg", "met", "wnd", "hue", "mut", "tmp"]
             bar_parts = []
             for i, (label, (_, g_min, g_max)) in enumerate(zip(labels, GENES)):
                 counts = [0] * (g_max - g_min + 1)
@@ -612,7 +632,7 @@ class World:
             tag = " 🦠" if sentinel.id in self.diseased else ""
             lines.append(
                 f"  {BOLD}\033[47m\033[30m{GLYPH_SET[g[5] % len(GLYPH_SET)]}"
-                f"\033[0m sentinel: [{g[0]} {g[1]} {g[2]} {g[3]} {g[4]} {g[5]} {g[6]}]"
+                f"\033[0m sentinel: [{g[0]} {g[1]} {g[2]} {g[3]} {g[4]} {g[5]} {g[6]} {g[7]}]"
                 f"  gen={sentinel.generation}  age={sentinel.age}  ⚡={sentinel.energy:.1f}{tag}"
             )
 
@@ -621,10 +641,10 @@ class World:
         for ev in self.events:
             lines.append(f"  {ev}")
         lines.append(
-            "  " + "  ".join(
-                f"{COLORS[i]}{GLYPH_SET[i]}{RESET}={GENES[i][0]}"
+            "  " + " ".join(
+                f"{COLORS[i]}{GLYPH_SET[i]}{RESET}{GENES[i][0]}"
                 for i in range(min(len(GENES), len(GLYPH_SET)))
-            ) + f"  {BOLD}★{RESET}=bounty  {BOLD}✿{RESET}=corpse"
+            ) + f"  {BOLD}·{RESET}food {BOLD}★{RESET}bounty {BOLD}✿{RESET}corpse"
         )
         return "\n".join(lines)
 
