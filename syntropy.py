@@ -125,7 +125,320 @@ INSTR_SET = [
     "ECALL","NOP"
 ]
 
+# ──────────────────────────────────────────
+# RV32 Decoder / Disassembler
+# ──────────────────────────────────────────
+
+_RV32_REGS = ["zero","ra","sp","gp","tp","t0","t1","t2","s0","s1","a0","a1","a2","a3","a4","a5",
+              "a6","a7","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","t3","t4","t5","t6"]
+
+def decode_rv32(inst: int) -> dict:
+    """Decode a RV32 instruction word into a structured dict.
+    Returns {mnemonic, rd, rs1, rs2, imm, opcode, funct3, funct7, raw, raw_str, args_str, is_compressed, ...}
+    """
+    opcode = inst & 0x7F
+    rd = (inst >> 7) & 0x1F
+    f3 = (inst >> 12) & 7
+    rs1 = (inst >> 15) & 0x1F
+    rs2 = (inst >> 20) & 0x1F
+    f7 = (inst >> 25) & 0x7F
+
+    def rname(i):
+        return _RV32_REGS[i]
+
+    rv = {"raw": inst, "raw_str": f"{inst:08x}", "opcode": opcode, "rd": rd, "rs1": rs1, "rs2": rs2,
+          "funct3": f3, "funct7": f7, "imm": 0, "mnemonic": "", "args_str": "",
+          "is_compressed": False, "rd_name": rname(rd), "rs1_name": rname(rs1), "rs2_name": rname(rs2)}
+
+    def a(r=None):
+        if r: rv["mnemonic"] = r
+        return rv
+
+    if opcode == 0x6F:  # JAL
+        imm = j_extract(inst)
+        rv["imm"], rv["args_str"] = imm, f"{rname(rd)}, {imm}"
+        return a("jal")
+    if opcode == 0x67:  # JALR
+        imm = i_imm(inst)
+        rv["imm"], rv["args_str"] = imm, f"{rname(rd)}, {rname(rs1)}, {imm}"
+        return a("jalr")
+    if opcode == 0x63:  # BRANCH
+        imm = b_extract(inst)
+        rv["imm"] = imm
+        brn = {0: "beq", 1: "bne", 4: "blt", 5: "bge", 6: "bltu", 7: "bgeu"}
+        mn = brn.get(f3)
+        rv["args_str"] = f"{rname(rs1)}, {rname(rs2)}, {imm}" if mn else ""
+        return a(mn)
+    if opcode == 0x03:  # LOAD
+        imm = i_imm(inst)
+        rv["imm"] = imm
+        ld = {0: "lb", 1: "lh", 2: "lw", 3: "ld", 4: "lbu", 5: "lhu"}
+        mn = ld.get(f3)
+        rv["args_str"] = f"{rname(rd)}, {imm}({rname(rs1)})" if mn else ""
+        return a(mn)
+    if opcode == 0x23:  # STORE
+        imm = s_imm(inst)
+        rv["imm"] = imm
+        st = {0: "sb", 1: "sh", 2: "sw", 3: "sd"}
+        mn = st.get(f3)
+        rv["args_str"] = f"{rname(rs2)}, {imm}({rname(rs1)})" if mn else ""
+        return a(mn)
+    if opcode == 0x13:  # OP-IMM
+        imm = i_imm(inst)
+        rv["imm"] = imm
+        sh = imm & 0x1F
+        is_srai = (imm >> 10) & 1
+        tbl = {0: ("addi", f"{rname(rd)}, {rname(rs1)}, {imm}"),
+               1: ("slli", f"{rname(rd)}, {rname(rs1)}, {sh}"),
+               2: ("slti", f"{rname(rd)}, {rname(rs1)}, {imm}"),
+               3: ("sltiu", f"{rname(rd)}, {rname(rs1)}, {imm}"),
+               4: ("xori", f"{rname(rd)}, {rname(rs1)}, {imm}"),
+               5: ("srli" if not is_srai else "srai", f"{rname(rd)}, {rname(rs1)}, {sh}"),
+               6: ("ori", f"{rname(rd)}, {rname(rs1)}, {imm}"),
+               7: ("andi", f"{rname(rd)}, {rname(rs1)}, {imm}")}
+        if f3 in tbl:
+            mn, args = tbl[f3]
+            if f3 == 5: mn = "srai" if is_srai else "srli"
+            rv["args_str"] = args
+            return a(mn)
+        return a()
+    if opcode == 0x33:  # OP
+        f7_30 = (f7 >> 5) & 1
+        tbl = {0: ("add" if not f7_30 else "sub"),
+               1: "sll", 2: "slt", 3: "sltu", 4: "xor",
+               5: ("srl" if not f7_30 else "sra"),
+               6: "or", 7: "and"}
+        if f3 in tbl:
+            mn = tbl[f3]
+            rv["args_str"] = f"{rname(rd)}, {rname(rs1)}, {rname(rs2)}"
+            # M-extension: check funct7=1
+            if f7 == 1 and f3 <= 7:
+                mtbl = {0: "mul", 1: "mulh", 2: "mulhsu", 3: "mulhu",
+                        4: "div", 5: "divu", 6: "rem", 7: "remu"}
+                return a(mtbl[f3])
+            return a(mn)
+        return a()
+    if opcode == 0x37:  # LUI
+        rv["imm"] = inst & 0xFFFFF000
+        rv["args_str"] = f"{rname(rd)}, {rv['imm']:#x}"
+        return a("lui")
+    if opcode == 0x17:  # AUIPC
+        rv["imm"] = inst & 0xFFFFF000
+        rv["args_str"] = f"{rname(rd)}, {rv['imm']:#x}"
+        return a("auipc")
+    if opcode == 0x73:  # SYSTEM
+        if inst == 0x00000073: return a("ecall")
+        if inst == 0x00100073: return a("ebreak")
+        if inst == 0x30200073: return a("mret")
+        if inst == 0x10500073: return a("wfi")
+        csr = inst >> 20
+        sys3 = {1: "csrrw", 2: "csrrs", 3: "csrrc", 5: "csrrwi", 6: "csrrsi", 7: "csrrci"}
+        if f3 in sys3:
+            rv["imm"], rv["args_str"] = csr, f"{rname(rd)}, {csr}, {rname(rs1)}"
+            return a(sys3[f3])
+        return a("csr")
+    if opcode == 0x0F:  # FENCE
+        if inst == 0x0ff0000f: return a("fence.i")
+        if inst == 0x00000013: return a("nop")
+        return a("fence")
+    # RV32F / RV32D
+    if opcode == 0x53:
+        rm = f3; rms = ["rne", "rtz", "rdn", "rup", "rmm", "", "", "dyn"][rm]
+        rr = f", {rms}" if rms else ""
+        ffloat = {
+            0x00: "fadd.s", 0x01: "fadd.d", 0x04: "fsub.s", 0x05: "fsub.d",
+            0x08: "fmul.s", 0x09: "fmul.d", 0x0C: "fdiv.s", 0x0D: "fdiv.d",
+        }
+        if f7 in ffloat:
+            rv["args_str"] = f"f{rd}, f{rs1}, f{rs2}{rr}"
+            return a(ffloat[f7])
+        if f7 == 0x10:
+            if f3 == 0: return a("fsgnj.s")
+            if f3 == 1: return a("fsgnjn.s")
+            if f3 == 2: return a("fsgnjx.s")
+        if f7 == 0x14:
+            if f3 == 0: rv["args_str"] = f"f{rd}, f{rs1}, f{rs2}"; return a("fmin.s")
+            if f3 == 1: rv["args_str"] = f"f{rd}, f{rs1}, f{rs2}"; return a("fmax.s")
+        if f7 == 0x50:
+            if f3 == 0: rv["args_str"] = f"f{rd}, f{rs1}, f{rs2}"; return a("fle.s")
+            if f3 == 1: rv["args_str"] = f"f{rd}, f{rs1}, f{rs2}"; return a("flt.s")
+            if f3 == 2: rv["args_str"] = f"f{rd}, f{rs1}, f{rs2}"; return a("feq.s")
+        if f7 == 0x20:
+            if f3 == 0: rv["args_str"] = f"f{rd}, f{rs1}{rr}"; return a("fcvt.w.s")
+            if f3 == 1: rv["args_str"] = f"f{rd}, f{rs1}{rr}"; return a("fcvt.wu.s")
+        if f7 == 0x60:
+            rv["args_str"] = f"f{rd}, f{rs1}{rr}"; return a("fcvt.s.w")
+        if f7 == 0x68:
+            rv["args_str"] = f"f{rd}, f{rs1}{rr}"; return a("fcvt.s.wu")
+        return a()
+    if opcode in (0x07,):  # FLW / FLD
+        imm = i_imm(inst)
+        rv["imm"] = imm
+        if f3 == 2: rv["args_str"] = f"f{rd}, {imm}({rname(rs1)})"; return a("flw")
+        if f3 == 3: rv["args_str"] = f"f{rd}, {imm}({rname(rs1)})"; return a("fld")
+        return a()
+    if opcode in (0x27,):  # FSW / FSD
+        imm = s_imm(inst)
+        rv["imm"] = imm
+        if f3 == 2: rv["args_str"] = f"f{rs2}, {imm}({rname(rs1)})"; return a("fsw")
+        if f3 == 3: rv["args_str"] = f"f{rs2}, {imm}({rname(rs1)})"; return a("fsd")
+        return a()
+    if opcode in (0x2B, 0x2F):  # AMO
+        if f3 == 2:
+            f5 = (inst >> 27) & 0x1F
+            amotbl = {2: "lr.w", 3: "sc.w", 1: "amoswap.w", 0: "amoadd.w", 4: "amoxor.w",
+                      12: "amoand.w", 8: "amoor.w", 16: "amomin.w", 20: "amomax.w",
+                      24: "amominu.w", 28: "amomaxu.w"}
+            if f5 in amotbl:
+                mn = amotbl[f5]
+                if f5 == 2: rv["args_str"] = f"{rname(rd)}, ({rname(rs1)})"
+                else: rv["args_str"] = f"{rname(rd)}, {rname(rs2)}, ({rname(rs1)})"
+                return a(mn)
+        return a()
+    # RV64 word ops (opcodes 0x3B, 0x1B)
+    if opcode == 0x3B:
+        if f3 == 0 and f7 == 0:
+            rv["args_str"] = f"{rname(rd)}, {rname(rs1)}, {rname(rs2)}"
+            return a("addw")
+        if f3 == 0 and f7 == 0x20:
+            rv["args_str"] = f"{rname(rd)}, {rname(rs1)}, {rname(rs2)}"
+            return a("subw")
+        return a()
+    if opcode == 0x1B:
+        if f3 == 0:
+            rv["args_str"] = f"{rname(rd)}, {rname(rs1)}, {i_imm(inst)}"
+            return a("addiw")
+        return a()
+    return a()  # unknown
+
+
+def rv32_to_py(inst: int) -> str:
+    """Translate a single RV32 instruction to a Python expression.
+    Uses r[N] register notation (no ABI names) for Pythonic look.
+    """
+    d = decode_rv32(inst)
+    mn = d["mnemonic"]
+    if not mn:
+        return f"pass  # 0x{inst:08x}"
+
+    r = lambda i: f"r{i}"
+    rd, rs1, rs2 = r(d["rd"]), r(d["rs1"]), r(d["rs2"])
+    imm = d["imm"]
+
+    # ── RV32I: ALU-reg ──
+    if mn == "add":   return f"{rd} = {rs1} + {rs2}"
+    if mn == "sub":   return f"{rd} = {rs1} - {rs2}"
+    if mn == "and":   return f"{rd} = {rs1} & {rs2}"
+    if mn == "or":    return f"{rd} = {rs1} | {rs2}"
+    if mn == "xor":   return f"{rd} = {rs1} ^ {rs2}"
+    if mn == "sll":   return f"{rd} = {rs1} << {rs2}"
+    if mn == "srl":   return f"{rd} = {rs1} >> {rs2}"
+    if mn == "sra":   return f"{rd} = sra({rs1}, {rs2})"
+    if mn == "slt":   return f"{rd} = 1 if {rs1} < {rs2} else 0"
+    if mn == "sltu":  return f"{rd} = 1 if ({rs1} & 0xFFFFFFFF) < ({rs2} & 0xFFFFFFFF) else 0"
+
+    # ── RV32I: ALU-imm ──
+    if mn == "addi":  return "pass" if (d["rd"] | d["rs1"] | imm) == 0 else f"{rd} = {rs1} + {imm}"
+    if mn == "andi":  return f"{rd} = {rs1} & {imm}"
+    if mn == "ori":   return f"{rd} = {rs1} | {imm}"
+    if mn == "xori":  return f"{rd} = {rs1} ^ {imm}"
+    if mn == "slli":  return f"{rd} = {rs1} << {imm & 0x1F}"
+    if mn == "srli":  return f"{rd} = ({rs1} & 0xFFFFFFFF) >> {imm & 0x1F}"
+    if mn == "srai":  return f"{rd} = sra({rs1}, {imm & 0x1F})"
+    if mn == "slti":  return f"{rd} = 1 if {rs1} < {imm} else 0"
+    if mn == "sltiu": return f"{rd} = 1 if ({rs1} & 0xFFFFFFFF) < ({imm} & 0xFFFFFFFF) else 0"
+
+    # ── RV32I: Load / Store ──
+    if mn == "lw":    return f"{rd} = mem[{rs1} + {imm}]"
+    if mn == "lbu":   return f"{rd} = mem[{rs1} + {imm}] & 0xFF"
+    if mn == "lb":    return f"{rd} = sext(mem[{rs1} + {imm}], 8)"
+    if mn == "lh":    return f"{rd} = sext(mem[{rs1} + {imm}], 16)"
+    if mn == "lhu":   return f"{rd} = mem[{rs1} + {imm}] & 0xFFFF"
+    if mn == "sw":    return f"mem[{rs1} + {imm}] = {rs2}"
+    if mn == "sb":    return f"mem[{rs1} + {imm}] = {rs2} & 0xFF"
+    if mn == "sh":    return f"mem[{rs1} + {imm}] = {rs2} & 0xFFFF"
+
+    # ── RV32I: Branch ──  (imm is a relative offset)
+    if mn == "beq":   return f"if {rs1} == {rs2}: pc += {imm}"
+    if mn == "bne":   return f"if {rs1} != {rs2}: pc += {imm}"
+    if mn == "blt":   return f"if {rs1} < {rs2}: pc += {imm}"
+    if mn == "bge":   return f"if {rs1} >= {rs2}: pc += {imm}"
+    if mn == "bltu":  return f"if ({rs1} & 0xFFFFFFFF) < ({rs2} & 0xFFFFFFFF): pc += {imm}"
+    if mn == "bgeu":  return f"if ({rs1} & 0xFFFFFFFF) >= ({rs2} & 0xFFFFFFFF): pc += {imm}"
+
+    # ── RV32I: Jump ──
+    if mn == "jal":   return f"pc += {imm}" if d["rd"] == 0 else f"{rd} = pc+4; pc += {imm}"
+    if mn == "jalr":
+        if d["rd"] == 0: return f"pc = {rs1} + {imm}"
+        return f"{rd} = pc+4; pc = {rs1} + {imm}"
+
+    # ── RV32I: Upper immediate ──
+    if mn == "lui":   return f"{rd} = {imm:#x}"
+    if mn == "auipc": return f"{rd} = pc + {imm:#x}"
+
+    # ── RV32I: System ──
+    if mn == "nop":   return "pass"
+    if mn == "ecall": return "pass  # ecall"
+    if mn == "ebreak":return "pass  # ebreak"
+    if mn == "mret":  return "pass  # mret"
+    if mn == "wfi":   return "pass  # wfi"
+    if mn in ("fence", "fence.i"): return "pass  # fence"
+
+    # ── RV32I: CSR ──
+    csr_ops = {"csrrw": " = ", "csrrs": " |= ", "csrrc": " &= ~",
+               "csrrwi": " = ", "csrrsi": " |= ", "csrrci": " &= ~"}
+    if mn in csr_ops:
+        op = csr_ops[mn]
+        if mn in ("csrrwi", "csrrsi", "csrrci"):
+            return f"{rd} = csr[{imm}]; csr[{imm}]{op}{d['rs1']}"
+        return f"{rd} = csr[{imm}]; csr[{imm}]{op}{rs1}"
+    if mn == "csr": return f"pass  # csr {imm}"
+
+    # ── RV32M ──
+    if mn == "mul":   return f"{rd} = {rs1} * {rs2}"
+    if mn == "mulh":  return f"{rd} = ({rs1} * {rs2}) >> 32"
+    if mn == "mulhsu":return f"{rd} = (s64({rs1}) * ({rs2} & 0xFFFFFFFF)) >> 32"
+    if mn == "mulhu": return f"{rd} = (({rs1} & 0xFFFFFFFF) * ({rs2} & 0xFFFFFFFF)) >> 32"
+    if mn == "div":   return f"{rd} = {rs1} // {rs2}"
+    if mn == "divu":  return f"{rd} = ({rs1} & 0xFFFFFFFF) // ({rs2} & 0xFFFFFFFF)"
+    if mn == "rem":   return f"{rd} = {rs1} % {rs2}"
+    if mn == "remu":  return f"{rd} = ({rs1} & 0xFFFFFFFF) % ({rs2} & 0xFFFFFFFF)"
+
+    return f"pass  # {mn}"
+
+
+def disasm_rv32(inst: int, addr: int = 0, show_addr: bool = False) -> str:
+    """Disassemble a single RV32 instruction word to a string."""
+    d = decode_rv32(inst)
+    if not d["mnemonic"]:
+        out = f"nop     # 0x{inst:08x}"
+    else:
+        out = f"{d['mnemonic']:8s} {d['args_str']}".strip()
+    if show_addr:
+        out = f"{addr:#010x}  {inst:08x}  {out}"
+    return out
+
+
 def rand_inst():
+    """Generate a random RV32 instruction."""
+    mn = random.choice(INSTR_SET)
+    rd = random.randint(0, 31); rs1 = random.randint(0, 31); rs2 = random.randint(0, 31)
+    imm = random.randint(-2048, 2047)
+    if mn in ("ADD","SUB","AND","OR","XOR","SLL","SRL","SRA","SLT","SLTU"):
+        return asm(mn, rd, rs1, rs2)
+    if mn in ("ADDI","SLTI","SLTIU","XORI","ORI","ANDI"):
+        return asm(mn, rd, rs1, imm)
+    if mn in ("SLLI","SRLI","SRAI"):
+        return asm(mn, rd, rs1, random.randint(0, 31))
+    if mn in ("LW","LB"): return asm(mn, rd, rs1, imm)
+    if mn in ("SW","SB"): return asm(mn, rs1, rs2, imm)
+    if mn in ("BEQ","BNE","BLT","BGE"):
+        return asm(mn, rs1, rs2, random.randint(-16, 15))
+    if mn == "JAL":  return asm("JAL", rd, random.randint(-16, 15))
+    if mn == "JALR": return asm("JALR", rd, rs1, random.randint(-2048, 2047))
+    if mn in ("LUI","AUIPC"): return asm(mn, rd, random.randint(0, 1048575))
+    if mn == "ECALL": return 0x00000073
+    return 0x00000013
     mn = random.choice(INSTR_SET)
     rd = random.randint(0,31); rs1 = random.randint(0,31); rs2 = random.randint(0,31)
     imm = random.randint(-2048, 2047)
@@ -1719,12 +2032,49 @@ class World:
         top_bar = f"{BOLD}╔{RESET}" + "".join(_hl(self._daylight_at(x, phase)) for x in range(WIDTH)) + f"{BOLD}╗{RESET}"
         bot_bar = f"{BOLD}╚{RESET}" + "".join(_hl(self._daylight_at(x, phase)) for x in range(WIDTH)) + f"{BOLD}╝{RESET}"
 
-        lines = [top_bar]
-        for y, row in enumerate(grid):
-            lines.append(f"{BOLD}║{RESET}{''.join(row)}{BOLD}║{RESET}")
-        lines.append(bot_bar)
+        # ── sidebar ──
+        import shutil
+        avail = shutil.get_terminal_size().columns - (WIDTH + 2) - 2
 
-        # Status
+        sb_lines: list[str] = []
+        if sentinel and sentinel.generation > 0:
+            g = sentinel.genome
+            decoded = []
+            for i in range(min(len(g), 18)):
+                decoded.append(disasm_rv32(g[i]))
+            prog = " ; ".join(decoded[:18])
+            if avail < len(prog) + 12:
+                prog = prog[:max(1, avail - 15)] + "..."
+            sb_lines.append(
+                f"gen={sentinel.generation} age={sentinel.age} "
+                f"⚡={sentinel.energy:.1f} wt={sentinel.weight:.2f} "
+                f"len={len(sentinel.genome)} "
+                f"bank={'B' if sentinel.active_bank else 'A'}"
+            )
+            sb_lines.append(f"└vm: {prog}")
+            max_py = min(HEIGHT + 2 - len(sb_lines) - 1, 18)
+            for i in range(max_py):
+                py_line = rv32_to_py(g[i])
+                if avail < len(py_line) + 10:
+                    py_line = py_line[:max(1, avail - 12)] + "..."
+                sb_lines.append(f"└py[{i}]: {py_line}")
+            if len(decoded) > max_py:
+                sb_lines.append(f"└...({len(decoded)-max_py} more)")
+
+        # ── grid with sidebar on right ──
+        lines: list[str] = []
+        for y in range(HEIGHT + 2):
+            if y == 0:
+                row_str = top_bar
+            elif y == HEIGHT + 1:
+                row_str = bot_bar
+            else:
+                row_str = f"{BOLD}║{RESET}{''.join(grid[y-1])}{BOLD}║{RESET}"
+            if y < len(sb_lines):
+                row_str += f"  {sb_lines[y]}"
+            lines.append(row_str)
+
+        # ── status lines ──
         n = len(self.organisms)
         if n > 0:
             avg_e = sum(o.energy for o in self.organisms) / n
@@ -1748,18 +2098,13 @@ class World:
                 f"T:{self.tick}  tot:{sum(o.energy+o.fat for o in self.organisms):.0f}/{MAX_SYSTEM_ENERGY:.0f}"
             )
 
-            # Day-night bar (fit within typical terminal width)
-            n = min(WIDTH, 60)
-            step = max(1, WIDTH // n)
+            # Day-night bar
+            bw = min(WIDTH, 60)
+            step = max(1, WIDTH // bw)
             dn_bar = ""
             for x in range(0, WIDTH, step):
                 dl = self._daylight_at(x, phase)
-                if dl > 0.6:
-                    dn_bar += "░"
-                elif dl > 0.3:
-                    dn_bar += "▒"
-                else:
-                    dn_bar += "█"
+                dn_bar += "░" if dl > 0.6 else ("▒" if dl > 0.3 else "█")
             lines.append(f"  [dn] {dn_bar}")
 
             # Population sparkline
@@ -1767,12 +2112,8 @@ class World:
                 max_pop = max(self.pop_history)
                 min_pop = min(self.pop_history)
                 span = max_pop - min_pop if max_pop > min_pop else 1
-                SPARK = "▁▂▃▄▅▆▇█"
-                sparkline = ""
                 window = self.pop_history[-min(60, len(self.pop_history)):]
-                for p in window:
-                    idx = int((p - min_pop) / span * (len(SPARK) - 1))
-                    sparkline += SPARK[idx]
+                sparkline = "".join("▁▂▃▄▅▆▇█"[int((p - min_pop) / span * 7)] for p in window)
                 lines.append(f"  └{'─' * min(50, len(window))}  {sparkline}")
 
             # Fitness sparkline
@@ -1780,14 +2121,11 @@ class World:
                 feats = self.fitness_history[-40:]
                 mn, mx = min(feats), max(feats)
                 rng = mx - mn if mx > mn else 1
-                fitline = ""
-                for f in feats:
-                    idx = int((f - mn) / rng * 7)
-                    fitline += "▁▂▃▄▅▆▇█"[idx]
+                fitline = "".join("▁▂▃▄▅▆▇█"[int((f - mn) / rng * 7)] for f in feats)
                 lines.append(f"  └fit              {fitline}")
 
             # Dominant genome fingerprint
-            gc: Dict[str, int] = {}
+            gc = {}
             for o in self.organisms:
                 k = str(o.genome[:6])
                 gc[k] = gc.get(k, 0) + 1
@@ -1795,31 +2133,7 @@ class World:
             pct = gc.get(dom, 0) / n * 100 if n else 0
             lines.append(f"  dom VM[:6]: {dom} ({pct:.0f}%)")
 
-            # Sentinel
-            if sentinel and sentinel.generation > 0:
-                RV_NAMES = ["ADD","SUB","SLL","SLT","SLTU","XOR","SRL","SRA","OR","AND",
-                            "ADDI","SLTI","SLTIU","XORI","ORI","ANDI","SLLI","SRLI","SRAI",
-                            "LW","SW","LB","SB",
-                            "BEQ","BNE","BLT","BGE","BLTU","BGEU",
-                            "JAL","JALR","LUI","AUIPC","ECALL","EBREAK"]
-                g = sentinel.genome
-                decoded = []
-                for i in range(min(len(g), 18)):
-                    inst = g[i]
-                    opcode = inst & 0x7F
-                    rd = (inst >> 7) & 0x1F
-                    name = f"rv32({(inst>>2)&0x1F})" if opcode in (0x37,0x17) else f"rv32 [{opcode:02x}]"
-                    decoded.append(f"{inst:08x}")
-                prog = " ".join(decoded[:18])
-                lines.append(
-                    f"  sentinel: gen={sentinel.generation} age={sentinel.age} "
-                    f"⚡={sentinel.energy:.1f} wt={sentinel.weight:.2f} "
-                    f"len={len(sentinel.genome)} "
-                    f"bank={'B' if sentinel.active_bank else 'A'}"
-                )
-                lines.append(f"  └vm: {prog}")
-                if len(decoded) > 18:
-                    lines.append(f"  └...({len(decoded)-18} more)")
+
 
         # Events
         self.events = self.events[-3:]
@@ -1932,14 +2246,14 @@ async def main():
                 g = best.genome
                 decoded = []
                 for i in range(min(len(g), 18)):
-                    decoded.append(f"{g[i]:08x}")
-                prog = " ".join(decoded[:18])
+                    decoded.append(disasm_rv32(g[i]))
+                prog = " ; ".join(decoded[:18])
                 print(f"  Best VM: gen={best.generation} age={best.age:.0f} "
                       f"⚡={best.energy:.1f} wt={best.weight:.2f} len={len(best.genome)} "
                       f"bank={'B' if best.active_bank else 'A'} ({len(best.genome_b)}b)")
                 print(f"  └vm: {prog}")
                 if len(decoded) > 18:
-                    print(f"  └...({len(decoded)-18} more)")
+                    print(f"  └...({len(decoded)-18} more vm instructions)")
 
         if not continuous or interrupted:
             print(f"\n  Extinction log written to {EXTINCTION_LOG_FILE}")
