@@ -21,6 +21,7 @@ from typing import Dict, List, Tuple, Optional, Set
 SEED = 42
 EXTINCTION_LOG_FILE = "extinction.json"
 SOUND_ENABLED = True
+ENVIRONMENTAL_SOUNDS_ENABLED = True
 SOUND_VOLUME = 0.3
 SHARED_MEM_ENABLED = False   # experimental: shared memory + symbolic signals (opt-in)
 SHARED_MEM_SIZE = 64
@@ -28,7 +29,7 @@ FIGHT_OVERLAP_ENABLED = False
 
 WIDTH = 72
 HEIGHT = 26
-INITIAL_ORGANISMS = 40
+INITIAL_ORGANISMS = 1
 INITIAL_RESOURCES = 60
 RESOURCE_REGEN = 3
 SEASON_LENGTH = (50, 80)
@@ -574,7 +575,7 @@ class RVVMBot:
         return RVVMBot(self.genome[:pt] + other.genome[pt:])
 
     def execute(self, budget: float, senses: Dict[int, float], tick: int = 0,
-                shared_mem: Optional[List[float]] = None) -> List[Tuple[int, int]]:
+                shared_mem: Optional[bytearray] = None) -> List[Tuple[int, int]]:
         self.r = [0] * 32
         self.pc = 0
         self.running = True
@@ -790,11 +791,11 @@ class RVVMBot:
         elif a7 == 8:  # GLOAD
             if self._shared_mem is not None:
                 slot = a0 % len(self._shared_mem)
-                self.r[10] = int(self._shared_mem[slot])
+                self.r[10] = self._shared_mem[slot]
         elif a7 == 9:  # GSTORE
             if self._shared_mem is not None:
                 slot = a0 % len(self._shared_mem)
-                self._shared_mem[slot] = float(a1)
+                self._shared_mem[slot] = max(0, min(255, a1))
 
 
 # Audio mixer — per-organism stereo audio in background thread
@@ -986,6 +987,7 @@ class Organism:
     vol_bass: float = 0.0
     vol_mid: float = 0.0
     vol_treble: float = 0.0
+    parent_id: int = -1
     action_counts: Dict[int, float] = field(default_factory=dict)
     last_regs: List[int] = field(default_factory=lambda: [0] * 32)
     facing: int = 0  # 0=N, 1=E, 2=S, 3=W; last direction acted in
@@ -1077,7 +1079,7 @@ class World:
         self.territory: Dict[Tuple[int, int], Dict[int, int]] = {}
         self.traces: Dict[Tuple[int, int], float] = {}
         self.signal_buffers: Dict[Tuple[int, int], List[float]] = {}
-        self.shared_mem: Optional[List[float]] = [0.0] * SHARED_MEM_SIZE if SHARED_MEM_ENABLED else None
+        self.shared_mem: Optional[bytearray] = bytearray(SHARED_MEM_SIZE) if SHARED_MEM_ENABLED else None
         self.symbol_buffers: Dict[Tuple[int, int], Dict[int, float]] = {}  # typed symbol channel
         self.death_stats: Dict[str, int] = {
             "starvation": 0, "predation": 0, "fighting": 0,
@@ -1112,7 +1114,7 @@ class World:
     }
 
     def _sound(self, event_type: str):
-        if not SOUND_ENABLED:
+        if not SOUND_ENABLED or not ENVIRONMENTAL_SOUNDS_ENABLED:
             return
         tone = self.SOUND_TONES.get(event_type)
         if tone:
@@ -1175,6 +1177,7 @@ class World:
     def _spawn(
         self, x: int, y: int, genome: list, energy: float = 3.0, generation: int = 0,
         genome_b: Optional[List[int]] = None, active_bank: int = 0,
+        parent_id: int = -1,
         parent_mem: Optional[List[float]] = None,
     ) -> Organism:
         ga = list(genome)
@@ -1190,6 +1193,7 @@ class World:
             age=0,
             generation=generation,
             id=_next_oid(),
+            parent_id=parent_id,
             freq_bass=random.uniform(30, 100),
             freq_mid=random.uniform(150, 600),
             freq_treble=random.uniform(700, 4000),
@@ -1338,6 +1342,8 @@ class World:
                 for other in self.organisms:
                     if other is org or other.energy <= 0:
                         continue
+                    if other.parent_id == org.id or org.parent_id == other.id:
+                        continue
                     if (other.x == org.x and other.y == org.y
                             and other.energy < org.energy * 0.6
                             and org.weight > other.weight):
@@ -1354,6 +1360,8 @@ class World:
             hit = None
             for other in self.organisms:
                 if other is org:
+                    continue
+                if other.parent_id == org.id or org.parent_id == other.id:
                     continue
                 if other.x == tx and other.y == ty and org.weight > other.weight:
                     power = max(0.1, org.energy) * 0.3
@@ -1372,7 +1380,7 @@ class World:
             if org.energy < ENERGY_COST_PER_CHILD * 0.6:
                 return
             neighbors = []
-            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
                 nx, ny = _wx(org.x + dx), _wy(org.y + dy)
                 if not any(o.x == nx and o.y == ny for o in self.organisms):
                     neighbors.append((nx, ny))
@@ -1383,7 +1391,7 @@ class World:
 
             # Look for a mate on adjacent cells
             mate = None
-            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
                 mx, my = _wx(org.x + dx), _wy(org.y + dy)
                 for o in self.organisms:
                     if o is not org and o.x == mx and o.y == my and o.energy >= 2.0:
@@ -1403,6 +1411,7 @@ class World:
                                     genome_b=child_gb,
                                     active_bank=random.randint(0, 1),
                                     energy=2.5, generation=child_g,
+                                    parent_id=org.id,
                                     parent_mem=org.vm.mem)
                 self._log_action(f"O{org.id} ♥ O{child.id}")
             else:
@@ -1413,8 +1422,9 @@ class World:
                 child = self._spawn(nx, ny, child_ga,
                                     genome_b=child_gb,
                                     active_bank=random.randint(0, 1),
-                            energy=2.0, generation=child_g,
-                            parent_mem=org.vm.mem)
+                                    energy=2.0, generation=child_g,
+                                    parent_id=org.id,
+                                    parent_mem=org.vm.mem)
                 if child_g > self.max_gen_ever:
                     self.max_gen_ever = child_g
                     self.events.append(f"Gen {child_g} reached!")
@@ -1425,13 +1435,14 @@ class World:
 
         elif action_id == Action.SOUND:
             vol = min(1.0, max(0.0, org.energy / 10.0))
-            s = _arg % 256
-            org.freq_bass = 40 + (s % 60)
-            org.freq_mid = 180 + ((s * 7) % 400)
-            org.freq_treble = 800 + ((s * 31) % 3200)
-            org.vol_bass = vol * 0.4
-            org.vol_mid = vol * 0.3
-            org.vol_treble = vol * 0.2
+            regs = org.last_regs
+            abs_val = lambda v, lo, hi: lo + (abs(v) % (hi - lo))
+            org.freq_bass = abs_val(regs[10], 20, 500)
+            org.freq_mid = abs_val(regs[11], 100, 2000)
+            org.freq_treble = abs_val(regs[12], 500, 8000)
+            org.vol_bass = vol * (0.1 + 0.9 * (abs(regs[13]) / 10000.0 if regs[13] else 0.4))
+            org.vol_mid = vol * (0.1 + 0.9 * (abs(regs[14]) / 10000.0 if regs[14] else 0.3))
+            org.vol_treble = vol * (0.1 + 0.9 * (abs(regs[15]) / 10000.0 if regs[15] else 0.2))
             self.mixer.set_org(org.id,
                                org.freq_bass, org.vol_bass,
                                org.freq_mid, org.vol_mid,
@@ -1506,19 +1517,20 @@ class World:
 
         # Environmental ambient audio — low freq events → bass, high freq events → treble
         p_dev = abs(self.pressure - 0.5) * 2.0
-        self.mixer.set_ambient("pressure", 40 + p_dev * 40, p_dev * 0.12, 0, 0, 0, 0)
-        self.mixer.set_ambient("moisture", 90 + self.moisture * 80, self.moisture * 0.08,
-                               0, 0, 0, 0)
         temp_warm = max(0.0, self.temp_diurnal)
         temp_cold = max(0.0, -self.temp_diurnal)
-        self.mixer.set_ambient("temperature", 50, temp_cold * 0.06,
-                               350 + temp_warm * 250, temp_warm * 0.07,
-                               0, 0)
         dl_treb = 1000 + self.daylight * 2000
-        self.mixer.set_ambient("daylight", 0, 0, 0, 0,
-                               dl_treb, self.daylight * 0.06)
         season_bass = 35 if self.season == "summer" else 50
-        self.mixer.set_ambient("season", season_bass, 0.04, 0, 0, 0, 0)
+        if ENVIRONMENTAL_SOUNDS_ENABLED:
+            self.mixer.set_ambient("pressure", 40 + p_dev * 40, p_dev * 0.12, 0, 0, 0, 0)
+            self.mixer.set_ambient("moisture", 90 + self.moisture * 80, self.moisture * 0.08,
+                                   0, 0, 0, 0)
+            self.mixer.set_ambient("temperature", 50, temp_cold * 0.06,
+                                   350 + temp_warm * 250, temp_warm * 0.07,
+                                   0, 0)
+            self.mixer.set_ambient("daylight", 0, 0, 0, 0,
+                                   dl_treb, self.daylight * 0.06)
+            self.mixer.set_ambient("season", season_bass, 0.04, 0, 0, 0, 0)
 
         # Carrying capacity
         carry_cap = WIDTH * HEIGHT * 0.4
@@ -1840,7 +1852,8 @@ class World:
 
             # Shared memory slow decay (values persist unless overwritten or allowed to fade)
             for i in range(len(self.shared_mem)):
-                self.shared_mem[i] *= 0.998
+                if self.shared_mem[i] > 0:
+                    self.shared_mem[i] = max(0, self.shared_mem[i] - 1)
 
         # Corpse resources
         for o in dead_list:
@@ -1929,17 +1942,7 @@ class World:
                 k = random.choice(list(self.territory.keys()))
                 del self.territory[k]
 
-        # Migration
-        self.migration_timer -= 1
-        if self.migration_timer <= 0:
-            batch = random.randint(*MIGRATION_BATCH)
-            for _ in range(batch):
-                x = random.randint(0, WIDTH - 1)
-                y = random.randint(0, HEIGHT - 1)
-                self._spawn(x, y, random_genome(random.randint(18, 60)), 4.0)
-            self.events.append(f"{batch} invaders arrived from beyond")
-            self._sound("migration")
-            self.migration_timer = random.randint(*MIGRATION_INTERVAL)
+        # Migration — disabled; no spontaneous generation
 
     def _shift_environment(self):
         remove_n = int(len(self.resources) * random.uniform(0.15, 0.4))
@@ -2093,7 +2096,7 @@ class World:
                 f"Gen:{max_g:3d}  Age:{avg_age:.1f}  "
                 f"Sp:{sp:2d}  H\u2019:{shannon:.2f}  Fos:{self.fossil_count:4d}  "
                 f"Res:{len(self.resources):3d}  "
-                + (f"Shm:{sum(1 for v in self.shared_mem if abs(v) > 0.01):2d}  " if SHARED_MEM_ENABLED else "")
+                + (f"Shm:{sum(1 for b in self.shared_mem if b != 0):2d}  " if SHARED_MEM_ENABLED else "")
                 + f"{'☀ sum' if self.season == 'summer' else '\u2744 win'}  "
                 f"T:{self.tick}  tot:{sum(o.energy+o.fat for o in self.organisms):.0f}/{MAX_SYSTEM_ENERGY:.0f}"
             )
@@ -2144,10 +2147,15 @@ class World:
 
 
 async def main():
-    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, MUTATION_RATE, VM_MEM_SIZE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY, MAX_MOVEMENT_SPEED, MAX_AGE, SHARED_MEM_ENABLED, SHARED_MEM_SIZE
+    global SOUND_ENABLED, ENVIRONMENTAL_SOUNDS_ENABLED, SOUND_VOLUME, TICK_RATE, MUTATION_RATE, VM_MEM_SIZE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY, MAX_MOVEMENT_SPEED, MAX_AGE, SHARED_MEM_ENABLED, SHARED_MEM_SIZE, INITIAL_ORGANISMS, DAY_LENGTH
     parser = argparse.ArgumentParser(description="VM-genome evolutionary ecosystem")
     parser.add_argument("--volume", type=float, default=SOUND_VOLUME)
     parser.add_argument("--no-sound", action="store_true")
+    parser.add_argument("--no-environmental-sounds", action="store_true")
+    parser.add_argument("--initial-population", type=int, default=INITIAL_ORGANISMS,
+                    help="number of organisms to start with (default: %(default)s)")
+    parser.add_argument("--day-length", type=int, default=DAY_LENGTH,
+                    help="ticks per full day/night cycle (default: %(default)s)")
     parser.add_argument("--tick-rate", type=float, default=TICK_RATE)
     parser.add_argument("--log", default=EXTINCTION_LOG_FILE)
     parser.add_argument("--seed", type=int, default=SEED)
@@ -2170,6 +2178,8 @@ async def main():
     args = parser.parse_args()
     if args.no_sound:
         SOUND_ENABLED = False
+    if args.no_environmental_sounds:
+        ENVIRONMENTAL_SOUNDS_ENABLED = False
     if args.shared_memory:
         SHARED_MEM_ENABLED = True
     SHARED_MEM_SIZE = max(1, args.shared_mem_size)
@@ -2187,6 +2197,8 @@ async def main():
         MAX_AGE = args.max_age if args.max_age > 0 else float('inf')
     MUTATION_RATE = max(0.0, min(1.0, args.mutation_rate))
     VM_MEM_SIZE = max(1, min(256, args.vm_memory))
+    INITIAL_ORGANISMS = max(0, args.initial_population)
+    DAY_LENGTH = max(1, args.day_length)
     continuous = args.continuous
 
     run_count = 0
