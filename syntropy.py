@@ -56,57 +56,112 @@ RESOURCE_TYPES = {
 }
 RESOURCE_KEYS = list(RESOURCE_TYPES.keys())
 
-# VM opcodes
-class Op:
-    NOP, MOV, ADD, SUB, MUL, DIV = range(6)
-    JMP, JZ, JG, JL = range(6, 10)
-    SENSE, ACT = 10, 11
-    PUSH, POP, CALL, RET = 12, 13, 14, 15
-    HALT, RAND, ENERGY = 16, 17, 18
-    MOD, CMP = 19, 20
-    AND, OR, XOR, NOT = 21, 22, 23, 24
-    IND = 25
-    MIN, MAX = 26, 27
-    ABS, NEG = 28, 29
-    DUP, JNE = 30, 31
-    SWAP, GEN = 32, 33
-    PICK, DEPTH = 34, 35
-    PC, SETPC = 36, 37
-    SQRT, EXP = 38, 39
-    TICK, DROP, OVER = 40, 41, 42
-    SHL, SHR, BIT = 43, 44, 45
-    MLOAD, MSTORE = 46, 47   # per-organism persistent memory (16 slots)
-    GLOAD, GSTORE = 48, 49   # world shared memory (64 slots)
-    TOTAL = 50
+# RISC-V RV32I helpers (from vmfight.py)
+MASK32 = 0xFFFFFFFF
 
-# Per-opcode instruction cost (budget consumed per execution)
-OP_COST = [
-    0.002,  # NOP
-    0.004,  # MOV
-    0.006, 0.006,  # ADD, SUB
-    0.012, 0.016,  # MUL, DIV
-    0.006,         # JMP
-    0.012, 0.012, 0.012,  # JZ, JG, JL
-    0.014, 0.014,  # SENSE, ACT
-    0.006, 0.006,  # PUSH, POP
-    0.014, 0.010,  # CALL, RET
-    0.002,         # HALT
-    0.016, 0.006,  # RAND, ENERGY
-    0.016, 0.008,  # MOD, CMP
-    0.008, 0.008, 0.008, 0.006,  # AND, OR, XOR, NOT
-    0.012,         # IND
-    0.010, 0.010,  # MIN, MAX
-    0.006, 0.006,  # ABS, NEG
-    0.008, 0.012,  # DUP, JNE
-    0.008, 0.010,  # SWAP, GEN
-    0.008, 0.006,  # PICK, DEPTH
-    0.006, 0.008,  # PC, SETPC
-    0.014, 0.016,  # SQRT, EXP
-    0.004, 0.004, 0.006,  # TICK, DROP, OVER
-    0.008, 0.008, 0.006,  # SHL, SHR, BIT
-    0.008, 0.010,          # MLOAD, MSTORE
-    0.012, 0.016,          # GLOAD, GSTORE
+def u32(x):
+    return x & MASK32
+
+def s32(x):
+    x &= MASK32
+    return x if x < 0x80000000 else x - 0x100000000
+
+def sext(v, n):
+    v &= (1 << n) - 1
+    sign = 1 << (n - 1)
+    return (v ^ sign) - sign
+
+def sra32(v, sh):
+    return u32(s32(v) >> sh)
+
+FUNCT3 = {"ADDI":0,"SLTI":2,"SLTIU":3,"XORI":4,"ORI":6,"ANDI":7,
+          "SLLI":1,"SRLI":5,"SRAI":5,
+          "ADD":0,"SUB":0,"SLL":1,"SLT":2,"SLTU":3,"XOR":4,"SRL":5,"SRA":5,"OR":6,"AND":7,
+          "BEQ":0,"BNE":1,"BLT":4,"BGE":5,
+          "LW":2,"LB":0,"SW":2,"SB":0,
+          "JALR":0}
+FUNCT7 = {"ADD":0,"SUB":0x20,"SLL":0,"SLT":0,"SLTU":0,"XOR":0,"SRL":0,"SRA":0x20,"OR":0,"AND":0}
+
+def enc_i(imm12, rs1, f3, rd, op):
+    return ((imm12&0xFFF)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|op
+def enc_r(f7, rs2, rs1, f3, rd):
+    return (f7<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x33
+def enc_s(imm12, rs2, rs1, f3):
+    return ((imm12>>5)<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|((imm12&0x1f)<<7)|0x23
+def enc_b(imm13, rs2, rs1, f3):
+    i = imm13&0x1fff
+    return ((i>>12)<<31)|(((i>>5)&0x3f)<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(((i>>1)&0xf)<<8)|((i>>11)<<7)|0x63
+def enc_u(imm20, rd, op):
+    return ((imm20<<12))|(rd<<7)|op
+def enc_j(imm21, rd):
+    i = imm21&0x1fffff
+    return (((i>>20)&1)<<31)|(((i>>1)&0x3ff)<<21)|(((i>>11)&1)<<20)|(((i>>12)&0xff)<<12)|(rd<<7)|0x6f
+
+def asm(mn, *a):
+    if mn == "ECALL": return 0x00000073
+    if mn == "NOP":   return 0x00000013
+    if mn == "EBREAK": return 0x00100073
+    if mn in ("LUI","AUIPC"): return enc_u(a[1], a[0], 0x37 if mn=="LUI" else 0x17)
+    if mn == "JAL":  return enc_j(a[1]*4, a[0])
+    if mn in ("BEQ","BNE","BLT","BGE"):
+        return enc_b(a[2]*4, a[1], a[0], FUNCT3[mn])
+    if mn in ("SW","SB"): return enc_s(a[2], a[1], a[0], FUNCT3[mn])
+    if mn in ("LW","LB"): return enc_i(a[2], a[1], FUNCT3[mn], a[0], 0x03)
+    if mn in ("ADDI","SLTI","SLTIU","XORI","ORI","ANDI"):
+        return enc_i(a[2], a[1], FUNCT3[mn], a[0], 0x13)
+    if mn in ("SLLI","SRLI","SRAI"):
+        s = a[2]&0x1f | (0x400 if mn=="SRAI" else 0)
+        return enc_i(s, a[1], FUNCT3[mn], a[0], 0x13)
+    if mn == "JALR": return enc_i(a[2], a[1], 0, a[0], 0x67)
+    if mn in ("ADD","SUB","SLL","SLT","SLTU","XOR","SRL","SRA","OR","AND"):
+        return enc_r(FUNCT7[mn], a[2], a[1], FUNCT3[mn], a[0])
+
+INSTR_SET = [
+    "ADD","SUB","AND","OR","XOR","SLL","SRL","SRA","SLT","SLTU",
+    "ADDI","ANDI","ORI","XORI","SLLI","SRLI","SRAI","SLTI","SLTIU",
+    "LW","SW","LB","SB",
+    "BEQ","BNE","BLT","BGE",
+    "JAL","JALR","LUI","AUIPC",
+    "ECALL","NOP"
 ]
+
+def rand_inst():
+    mn = random.choice(INSTR_SET)
+    rd = random.randint(0,31); rs1 = random.randint(0,31); rs2 = random.randint(0,31)
+    imm = random.randint(-2048, 2047)
+    if mn in ("ADD","SUB","AND","OR","XOR","SLL","SRL","SRA","SLT","SLTU"):
+        return asm(mn, rd, rs1, rs2)
+    if mn in ("ADDI","SLTI","SLTIU","XORI","ORI","ANDI"):
+        return asm(mn, rd, rs1, imm)
+    if mn in ("SLLI","SRLI","SRAI"):
+        return asm(mn, rd, rs1, random.randint(0,31))
+    if mn in ("LW","LB"): return asm(mn, rd, rs1, imm)
+    if mn in ("SW","SB"): return asm(mn, rs1, rs2, imm)
+    if mn in ("BEQ","BNE","BLT","BGE"):
+        return asm(mn, rs1, rs2, random.randint(-16,15))
+    if mn == "JAL":  return asm("JAL", rd, random.randint(-16,15))
+    if mn == "JALR": return asm("JALR", rd, rs1, random.randint(-2048,2047))
+    if mn in ("LUI","AUIPC"): return asm(mn, rd, random.randint(0,1048575))
+    if mn == "ECALL": return 0x00000073
+    return 0x00000013
+
+def b_extract(inst):
+    imm = (((inst>>31)&1)<<12)|(((inst>>25)&0x3f)<<5)|(((inst>>8)&0xf)<<1)|(((inst>>7)&1)<<11)
+    return sext(imm, 13)
+def j_extract(inst):
+    imm = (((inst>>31)&1)<<20)|(((inst>>21)&0x3ff)<<1)|(((inst>>20)&1)<<11)|(((inst>>12)&0xff)<<12)
+    return sext(imm, 21)
+def i_imm(inst): return sext(inst>>20, 12)
+def s_imm(inst): return sext(((inst>>25)<<5)|((inst>>7)&0x1f), 12)
+
+# RV memory map for syntropy
+SENSE_BASE = 0x400
+ACTION_BASE = 0x500
+ACTION_CNT_ADDR = 0x540
+BUDGET_ADDR = 0x544
+TICK_ADDR = 0x548
+SHARED_MEM_BASE = 0x600
+SENSE_SCALE = 1000
 
 class Sensor:
     FOOD_X, FOOD_Y, FOOD_DIST = 0, 1, 2
@@ -136,7 +191,7 @@ class Action:
     HGT = 8      # swap a genome byte with a neighboring organism
     TOTAL = 9
 
-NUM_REGS = 4  # can be overridden via --n-registers CLI flag
+NUM_REGS = 32  # RISC-V RV32I has 32 registers (x0-x31)
 NUM_SENSORS = 28
 NUM_ACTIONS = 9
 
@@ -165,208 +220,268 @@ SPECIES_ROOTS = [
 _name_cache: Dict[Tuple[int, ...], str] = {}
 
 
-@dataclass
-class GenomeVM:
-    genome: List[int]
-    regs: List[float] = field(default_factory=lambda: [0.0] * NUM_REGS)
-    pc: int = 0
-    stack: List[int] = field(default_factory=list)
-    running: bool = True
-    instr_count: int = 0
-    mem: List[float] = field(default_factory=lambda: [0.0] * VM_MEM_SIZE)
+class RVVMBot:
+    """RISC-V RV32I VM used as the organism's genome/brains.
 
-    def clone_mutated(self, rate: float = 0.06) -> 'GenomeVM':
+    Memory map:
+        0x0000-0x03FF: General RAM (local mem slots 0-15 at 0x0000+slot*4)
+        0x0400-0x04FF: Sensor inputs (64 sensors x4 bytes, read-only to host)
+        0x0500-0x053F: Action output buffer (16 x4 bytes)
+        0x0540:       Action count (byte)
+        0x0544:       Remaining budget (scaled int)
+        0x0548:       Current tick
+        0x0600-0x06FF: Shared memory (64 x4 bytes, if enabled)
+    """
+
+    def __init__(self, genome):
+        self.genome = list(genome)
+        self.r = [0] * 32
+        self.pc = 0
+        self.running = True
+        self.instr_count = 0
+        self.mem = bytearray(4096)
+        self._senses = {}
+        self._budget = 0.0
+        self._shared_mem = None
+
+    def clone_mutated(self, rate: float = 0.06) -> 'RVVMBot':
         ng = list(self.genome)
         for i in range(len(ng)):
             if random.random() < rate:
-                ng[i] = max(0, min(255, ng[i] + random.choice([-2, -1, 1, 2])))
-        if random.random() < rate * 0.4 and len(ng) < 600:
-            idx = (random.randrange(0, len(ng) + 1) // 3) * 3
-            ng[idx:idx] = [random.randint(0, Op.TOTAL - 1),
-                           random.randint(0, 255), random.randint(0, 255)]
-        if random.random() < rate * 0.2 and len(ng) > 9:
-            idx = (random.randrange(0, len(ng)) // 3) * 3
-            ng = ng[:idx] + ng[idx + 3:]
-        return GenomeVM(genome=ng)
+                for _ in range(random.randint(1, 3)):
+                    ng[i] ^= (1 << random.randint(0, 31))
+        if random.random() < rate * 0.4 and len(ng) < 200:
+            ng.insert(random.randrange(0, len(ng) + 1), rand_inst())
+        if random.random() < rate * 0.2 and len(ng) > 3:
+            ng.pop(random.randrange(len(ng)))
+        return RVVMBot(ng)
 
-    def crossover(self, other: 'GenomeVM') -> 'GenomeVM':
-        pt = (random.randrange(0, min(len(self.genome), len(other.genome)), 3))
-        return GenomeVM(genome=self.genome[:pt] + other.genome[pt:])
-
-    def _rg(self, v: int) -> float:
-        return self.regs[v % NUM_REGS]
-
-    @staticmethod
-    def _to_float(x):
-        try:
-            return float(x)
-        except OverflowError:
-            return float('inf') if x > 0 else float('-inf')
-
-    def _sr(self, v: int, val: float):
-        self.regs[v % NUM_REGS] = val
-
-    def _val(self, v: int) -> float:
-        return self._rg(v) if v < 64 else float(v) / 16.0
+    def crossover(self, other: 'RVVMBot') -> 'RVVMBot':
+        pt = random.randrange(0, min(len(self.genome), len(other.genome)))
+        return RVVMBot(self.genome[:pt] + other.genome[pt:])
 
     def execute(self, budget: float, senses: Dict[int, float], tick: int = 0,
                 shared_mem: Optional[List[float]] = None) -> List[Tuple[int, int]]:
-        self.regs = [0.0] * NUM_REGS
+        self.r = [0] * 32
         self.pc = 0
-        self.stack = []
         self.running = True
         self.instr_count = 0
-        used = 0.0
-        actions = []
-        glen = len(self.genome)
+        self.mem = bytearray(4096)
+        self._senses = senses
+        self._budget = budget
+        self._shared_mem = shared_mem
+        self._action_words: List[Tuple[int, int]] = []
 
-        while self.running and used < budget and self.instr_count < 200:
-            self.instr_count += 1
+        for sid, val in senses.items():
+            addr = SENSE_BASE + sid * 4
+            if addr + 4 <= len(self.mem):
+                ival = int(val * SENSE_SCALE)
+                ival = max(-2**31, min(2**31 - 1, ival))
+                self.mem[addr:addr+4] = ival.to_bytes(4, 'little', signed=True)
 
-            if self.pc < 0 or self.pc >= glen - 2:
+        self.mem[TICK_ADDR:TICK_ADDR+4] = tick.to_bytes(4, 'little', signed=True)
+        budget_int = max(0, min(2**31-1, int(budget * 100)))
+        self.mem[BUDGET_ADDR:BUDGET_ADDR+4] = budget_int.to_bytes(4, 'little', signed=True)
+
+        max_instr = max(10, min(200, int(budget * 50)))
+        for _ in range(max_instr):
+            if not self.running:
                 break
-            op = int(self.genome[self.pc]) % Op.TOTAL
-            a1 = int(self.genome[self.pc + 1]) % 256
-            a2 = int(self.genome[self.pc + 2]) % 256
-            self.pc += 3
-            if self.pc >= glen:
-                self.pc = 0
+            self._step()
 
-            used += OP_COST[op]
+        actions = []
+        used = set()
+        for rv in self.r:
+            if rv == 0:
+                continue
+            act_id = rv & 0xF
+            if act_id >= Action.TOTAL:
+                continue
+            key = (act_id, (rv >> 4) & 0xF)
+            if key in used:
+                continue
+            used.add(key)
+            actions.append((act_id, (rv >> 4) & 0xF, 0.0))
+            if len(actions) >= 8:
+                break
 
-            ridx = a1 % NUM_REGS
-            v = self._val(a2)
-            rv = self._rg(a1)
-
-            if op == Op.NOP:
-                pass
-            elif op == Op.MOV:
-                self._sr(ridx, v)
-            elif op == Op.ADD:
-                self._sr(ridx, rv + v)
-            elif op == Op.SUB:
-                self._sr(ridx, rv - v)
-            elif op == Op.MUL:
-                self._sr(ridx, rv * max(-50, min(50, v)))
-            elif op == Op.DIV:
-                if abs(v) > 0.001:
-                    self._sr(ridx, rv / v)
-            elif op == Op.JMP:
-                self.pc = (a1 % max(3, glen)) // 3 * 3
-            elif op == Op.JZ:
-                if abs(rv) < 0.001:
-                    self.pc = (a2 % max(3, glen)) // 3 * 3
-            elif op == Op.JG:
-                if rv > 0:
-                    self.pc = (a2 % max(3, glen)) // 3 * 3
-            elif op == Op.JL:
-                if rv < 0:
-                    self.pc = (a2 % max(3, glen)) // 3 * 3
-            elif op == Op.SENSE:
-                sid = a1 % NUM_SENSORS
-                used += (a1 / 256.0) * 0.004
-                self._sr(a2 % NUM_REGS, senses.get(sid, 0.0))
-            elif op == Op.ACT:
-                act_id = a1 % Action.TOTAL
-                used += (a1 / 256.0) * 0.004
-                actions.append((act_id, a2, a1 / 256.0))
-            elif op == Op.PUSH:
-                self.stack.append(int(rv))
-            elif op == Op.POP:
-                if self.stack:
-                    self._sr(ridx, self._to_float(self.stack.pop()))
-            elif op == Op.CALL:
-                self.stack.append(self.pc)
-                self.pc = (a1 % max(3, glen)) // 3 * 3
-            elif op == Op.RET:
-                if self.stack:
-                    self.pc = self.stack.pop()
-                else:
-                    self.running = False
-            elif op == Op.HALT:
-                self.running = False
-            elif op == Op.RAND:
-                self._sr(ridx, random.random() * 10.0)
-            elif op == Op.ENERGY:
-                self._sr(ridx, budget - used)
-            elif op == Op.MOD:
-                if abs(v) > 0.001:
-                    self._sr(ridx, rv % v)
-            elif op == Op.CMP:
-                self._sr(ridx, 1.0 if rv > v else (-1.0 if rv < v else 0.0))
-            elif op == Op.AND:
-                self._sr(ridx, self._to_float(int(rv) & int(v)))
-            elif op == Op.OR:
-                self._sr(ridx, self._to_float(int(rv) | int(v)))
-            elif op == Op.XOR:
-                self._sr(ridx, self._to_float(int(rv) ^ int(v)))
-            elif op == Op.NOT:
-                self._sr(ridx, self._to_float(~int(rv)))
-            elif op == Op.IND:
-                self._sr(ridx, self._rg(int(v) % NUM_REGS))
-            elif op == Op.MIN:
-                self._sr(ridx, min(rv, v))
-            elif op == Op.MAX:
-                self._sr(ridx, max(rv, v))
-            elif op == Op.ABS:
-                self._sr(ridx, abs(rv))
-            elif op == Op.NEG:
-                self._sr(ridx, -rv)
-            elif op == Op.DUP:
-                if self.stack:
-                    self.stack.append(self.stack[-1])
-            elif op == Op.JNE:
-                if abs(rv) >= 0.001:
-                    self.pc = (a2 % max(3, glen)) // 3 * 3
-            elif op == Op.SWAP:
-                r2 = a2 % NUM_REGS
-                self.regs[ridx], self.regs[r2] = self.regs[r2], self.regs[ridx]
-            elif op == Op.GEN:
-                idx = a1 % max(1, len(self.genome))
-                self._sr(a2 % NUM_REGS, self._to_float(self.genome[idx]))
-            elif op == Op.PICK:
-                if self.stack:
-                    d = a1 % len(self.stack)
-                    self._sr(a2 % NUM_REGS, self._to_float(self.stack[-d - 1]))
-                else:
-                    self._sr(a2 % NUM_REGS, 0.0)
-            elif op == Op.DEPTH:
-                self._sr(a2 % NUM_REGS, self._to_float(len(self.stack)))
-            elif op == Op.PC:
-                self._sr(a2 % NUM_REGS, self._to_float(self.pc))
-            elif op == Op.SETPC:
-                new_pc = int(abs(rv))
-                self.pc = (new_pc % max(3, glen)) // 3 * 3
-            elif op == Op.SQRT:
-                self._sr(a2 % NUM_REGS, math.sqrt(max(0.0, rv)))
-            elif op == Op.EXP:
-                self._sr(a2 % NUM_REGS, math.exp(max(-10.0, min(10.0, rv))))
-            elif op == Op.TICK:
-                self._sr(a2 % NUM_REGS, self._to_float(tick))
-            elif op == Op.DROP:
-                if self.stack:
-                    self.stack.pop()
-            elif op == Op.OVER:
-                if len(self.stack) >= 2:
-                    self.stack.append(self.stack[-2])
-            elif op == Op.SHL:
-                self._sr(ridx, self._to_float(int(rv) << (a2 % 16)))
-            elif op == Op.SHR:
-                self._sr(ridx, self._to_float(int(rv) >> (a2 % 16)))
-            elif op == Op.BIT:
-                self._sr(a2 % NUM_REGS, 1.0 if (int(abs(rv)) >> (a1 & 7)) & 1 else 0.0)
-            elif op == Op.MLOAD:
-                self._sr(ridx, self.mem[a2 % VM_MEM_SIZE])
-            elif op == Op.MSTORE:
-                self.mem[a2 % VM_MEM_SIZE] = rv
-            elif op == Op.GLOAD:
-                if shared_mem is not None:
-                    self._sr(ridx, shared_mem[a2 % len(shared_mem)])
-            elif op == Op.GSTORE:
-                if shared_mem is not None:
-                    shared_mem[a2 % len(shared_mem)] = rv
+        for i in range(16):
+            word = struct.unpack_from('<i', self.mem, ACTION_BASE + i * 4)[0]
+            if word == 0:
+                continue
+            act_id = word & 0xFF
+            if act_id >= Action.TOTAL:
+                continue
+            key = (act_id, (word >> 8) & 0xFF)
+            if key in used:
+                continue
+            used.add(key)
+            actions.append((act_id, (word >> 8) & 0xFF, 0.0))
 
         return actions
+
+    def _step(self):
+        if not self.running or self.pc < 0 or self.pc >= len(self.genome) * 4:
+            self.running = False
+            return
+
+        self.instr_count += 1
+        idx = self.pc // 4
+        inst = u32(self.genome[idx])
+        pc_next = u32(self.pc + 4)
+
+        opcode = inst & 0x7F
+        rd = (inst >> 7) & 0x1F
+        f3 = (inst >> 12) & 0x7
+        rs1 = (inst >> 15) & 0x1F
+        rs2 = (inst >> 20) & 0x1F
+        f7 = (inst >> 25) & 0x7F
+        vrs1 = u32(self.r[rs1])
+        vrs2 = u32(self.r[rs2])
+
+        if opcode == 0x73:       # SYSTEM
+            if inst == 0x00000073:
+                self._ecall()
+        elif opcode == 0x6F:     # JAL
+            if rd:
+                self.r[rd] = u32(pc_next)
+            pc_next = u32(self.pc + j_extract(inst))
+        elif opcode == 0x67:     # JALR
+            if rd:
+                self.r[rd] = u32(pc_next)
+            pc_next = (vrs1 + i_imm(inst)) & ~1
+        elif opcode == 0x63:     # BRANCH
+            taken = {0: vrs1 == vrs2, 1: vrs1 != vrs2, 4: s32(vrs1) < s32(vrs2),
+                     5: s32(vrs1) >= s32(vrs2),
+                     6: vrs1 < vrs2, 7: vrs1 >= vrs2}.get(f3)
+            if taken:
+                pc_next = u32(self.pc + b_extract(inst))
+        elif opcode == 0x03:     # LOAD
+            addr = u32(vrs1 + i_imm(inst))
+            val = 0
+            if addr + 4 <= len(self.mem):
+                if f3 == 2:    # LW
+                    val = struct.unpack_from('<i', self.mem, addr)[0]
+                elif f3 == 1:  # LH
+                    val = sext(struct.unpack_from('<h', self.mem, addr)[0], 16)
+                elif f3 == 5:  # LHU
+                    val = struct.unpack_from('<H', self.mem, addr)[0]
+                elif f3 == 4:  # LBU
+                    val = self.mem[addr]
+                else:          # LB
+                    val = sext(self.mem[addr], 8)
+            if rd:
+                self.r[rd] = u32(val)
+        elif opcode == 0x23:     # STORE
+            addr = u32(vrs1 + s_imm(inst))
+            if addr + 4 <= len(self.mem):
+                v = u32(self.r[rs2])
+                if f3 == 2:    # SW
+                    struct.pack_into('<i', self.mem, addr, s32(v))
+                    act_id = v & 0xF
+                    if act_id < Action.TOTAL and len(self._action_words) < 16:
+                        arg = (v >> 4) & 0xF
+                        self._action_words.append((act_id, arg, 0.0))
+                elif f3 == 0:  # SB
+                    self.mem[addr] = v & 0xFF
+                elif f3 == 1:  # SH
+                    v16 = v & 0xFFFF
+                    struct.pack_into('<h', self.mem, addr, v16 if v16 < 0x8000 else v16 - 0x10000)
+        elif opcode == 0x13:     # OP-IMM
+            imm = i_imm(inst)
+            if rd:
+                if f3 == 0:
+                    self.r[rd] = u32(vrs1 + imm)
+                elif f3 == 1:
+                    self.r[rd] = u32(vrs1 << (imm & 0x1F))
+                elif f3 == 2:
+                    self.r[rd] = 1 if s32(vrs1) < imm else 0
+                elif f3 == 3:
+                    self.r[rd] = 1 if vrs1 < u32(imm) else 0
+                elif f3 == 4:
+                    self.r[rd] = u32(vrs1 ^ imm)
+                elif f3 == 5:  # SRLI / SRAI
+                    sh = imm & 0x1F
+                    self.r[rd] = sra32(vrs1, sh) if (imm >> 10) & 1 else u32(vrs1 >> sh)
+                elif f3 == 6:
+                    self.r[rd] = u32(vrs1 | imm)
+                elif f3 == 7:
+                    self.r[rd] = u32(vrs1 & imm)
+        elif opcode == 0x33:     # OP
+            f7_30 = (f7 >> 5) & 1
+            if rd:
+                if f3 == 0:
+                    self.r[rd] = u32(vrs1 - vrs2) if f7_30 else u32(vrs1 + vrs2)
+                elif f3 == 1:
+                    self.r[rd] = u32(vrs1 << (vrs2 & 0x1F))
+                elif f3 == 2:
+                    self.r[rd] = 1 if s32(vrs1) < s32(vrs2) else 0
+                elif f3 == 3:
+                    self.r[rd] = 1 if vrs1 < vrs2 else 0
+                elif f3 == 4:
+                    self.r[rd] = u32(vrs1 ^ vrs2)
+                elif f3 == 5:
+                    self.r[rd] = sra32(vrs1, vrs2 & 0x1F) if f7_30 else u32(vrs1 >> (vrs2 & 0x1F))
+                elif f3 == 6:
+                    self.r[rd] = u32(vrs1 | vrs2)
+                elif f3 == 7:
+                    self.r[rd] = u32(vrs1 & vrs2)
+        elif opcode == 0x37:     # LUI
+            if rd:
+                self.r[rd] = u32(inst >> 12 << 12)
+        elif opcode == 0x17:     # AUIPC
+            if rd:
+                self.r[rd] = u32(self.pc + (inst >> 12 << 12))
+
+        self.r[0] = 0
+        self.pc = pc_next
+
+    def _ecall(self):
+        a7 = self.r[17] & 0xFF
+        a0 = u32(self.r[10])
+        a1 = u32(self.r[11])
+
+        if a7 == 0:  # SENSE
+            sid = a0 % NUM_SENSORS
+            val = self._senses.get(sid, 0.0)
+            self.r[10] = int(val * SENSE_SCALE)
+        elif a7 == 1:  # ACT
+            act_id = a0 % Action.TOTAL
+            arg = int(a1) & 0xFF
+            word = (act_id & 0xFF) | ((arg & 0xFF) << 8)
+            for i in range(16):
+                addr = ACTION_BASE + i * 4
+                existing = struct.unpack_from('<i', self.mem, addr)[0]
+                if existing == 0:
+                    struct.pack_into('<i', self.mem, addr, word)
+                    break
+        elif a7 == 2:  # ENERGY
+            remaining = max(0, self._budget - self.instr_count * 0.01)
+            self.r[10] = int(remaining * 1000)
+        elif a7 == 3:  # HALT
+            self.running = False
+        elif a7 == 4:  # RAND
+            self.r[10] = random.randint(0, 10000)
+        elif a7 == 5:  # TICK
+            val = struct.unpack_from('<i', self.mem, TICK_ADDR)[0]
+            self.r[10] = val
+        elif a7 == 6:  # MLOAD
+            slot = a0 % VM_MEM_SIZE
+            addr = slot * 4
+            val = struct.unpack_from('<i', self.mem, addr)[0]
+            self.r[10] = val
+        elif a7 == 7:  # MSTORE
+            slot = a0 % VM_MEM_SIZE
+            addr = slot * 4
+            struct.pack_into('<i', self.mem, addr, a1)
+        elif a7 == 8:  # GLOAD
+            if self._shared_mem is not None:
+                slot = a0 % len(self._shared_mem)
+                self.r[10] = int(self._shared_mem[slot])
+        elif a7 == 9:  # GSTORE
+            if self._shared_mem is not None:
+                slot = a0 % len(self._shared_mem)
+                self._shared_mem[slot] = float(a1)
 
 
 # Audio mixer — per-organism stereo audio in background thread
@@ -538,7 +653,7 @@ def _species_name(genome: tuple) -> str:
 class Organism:
     x: int
     y: int
-    vm: GenomeVM
+    vm: RVVMBot
     energy: float
     age: int
     generation: int
@@ -559,7 +674,7 @@ class Organism:
     vol_mid: float = 0.0
     vol_treble: float = 0.0
     action_counts: Dict[int, float] = field(default_factory=dict)
-    last_regs: List[float] = field(default_factory=lambda: [0.0] * NUM_REGS)
+    last_regs: List[int] = field(default_factory=lambda: [0] * 32)
     facing: int = 0  # 0=N, 1=E, 2=S, 3=W; last direction acted in
 
     @property
@@ -599,19 +714,17 @@ def _mutate_genome(genome: List[int], rate: float = MUTATION_RATE) -> List[int]:
     ng = list(genome)
     for i in range(len(ng)):
         if random.random() < rate:
-            ng[i] = max(0, min(255, ng[i] + random.choice([-2, -1, 1, 2])))
-    if random.random() < rate * 0.4 and len(ng) < 600:
-        idx = (random.randrange(0, len(ng) + 1) // 3) * 3
-        ng[idx:idx] = [random.randint(0, Op.TOTAL - 1),
-                       random.randint(0, 255), random.randint(0, 255)]
-    if random.random() < rate * 0.2 and len(ng) > 9:
-        idx = (random.randrange(0, len(ng)) // 3) * 3
-        ng = ng[:idx] + ng[idx + 3:]
+            for _ in range(random.randint(1, 3)):
+                ng[i] ^= (1 << random.randint(0, 31))
+    if random.random() < rate * 0.4 and len(ng) < 200:
+        ng.insert(random.randrange(0, len(ng) + 1), rand_inst())
+    if random.random() < rate * 0.2 and len(ng) > 3:
+        ng.pop(random.randrange(len(ng)))
     return ng
 
 
-def random_genome(length: int = 30) -> List[int]:
-    return [random.randint(0, 255) for _ in range(length)]
+def random_genome(length: int = 10) -> List[int]:
+    return [rand_inst() for _ in range(length)]
 
 
 class World:
@@ -753,7 +866,7 @@ class World:
     ) -> Organism:
         ga = list(genome)
         gb = list(genome_b) if genome_b is not None else list(genome)
-        vm = GenomeVM(genome=ga)
+        vm = RVVMBot(genome=ga)
         org = Organism(
             x=_wx(x), y=_wy(y),
             vm=vm,
@@ -773,8 +886,10 @@ class World:
         )
         org.vm.genome = ga
         if parent_mem is not None:
-            for i in range(min(len(parent_mem), VM_MEM_SIZE)):
-                org.vm.mem[i] = parent_mem[i] + random.gauss(0, 0.05)
+            size = min(len(parent_mem), VM_MEM_SIZE * 4)
+            for i in range(size):
+                v = parent_mem[i] + random.randint(-2, 2)
+                org.vm.mem[i] = max(0, min(255, v))
         self.organisms.append(org)
         self.all_genomes_seen.add(tuple(ga))
         return org
@@ -1113,7 +1228,7 @@ class World:
             senses = self.compute_senses(org)
             budget = min(org.energy * 0.4, 8.0)
             actions = org.vm.execute(budget, senses, tick=self.tick, shared_mem=self.shared_mem)
-            org.last_regs = org.vm.regs.copy()
+            org.last_regs = org.vm.r.copy()
             org.vm.genome = org.genome_a
             return (org, actions, senses)
 
@@ -1295,7 +1410,7 @@ class World:
             # Random spontaneous mutation
             if random.random() < MUTATION_RATE * 0.0667:
                 i = random.randrange(len(org.genome))
-                org.vm.genome[i] = max(0, min(255, org.vm.genome[i] + random.choice([-1, 1])))
+                org.vm.genome[i] ^= (1 << random.randint(0, 31))
 
             # Disease
             if org.id in self.diseased:
@@ -1363,10 +1478,8 @@ class World:
             # Mutation pressure from reproduction overhead
             if org.energy >= repro_thresh * 1.5 and random.random() < MUTATION_RATE * 0.5:
                 target = org.genome_a if random.random() < 0.5 else org.genome_b
-                if len(target) < 600 and random.random() < 0.5:
-                    idx = (random.randrange(0, len(target) + 1) // 3) * 3
-                    target[idx:idx] = [random.randint(0, Op.TOTAL - 1),
-                                       random.randint(0, 255), random.randint(0, 255)]
+                if len(target) < 200 and random.random() < 0.5:
+                    target.insert(random.randrange(0, len(target) + 1), rand_inst())
 
         # Remove dead
         pop_before = len(self.organisms)
@@ -1684,20 +1797,19 @@ class World:
 
             # Sentinel
             if sentinel and sentinel.generation > 0:
-                OP_NAMES = ["NOP","MOV","ADD","SUB","MUL","DIV","JMP","JZ","JG","JL",
-                            "SENSE","ACT","PUSH","POP","CALL","RET","HALT","RAND","ENERGY",
-                            "MOD","CMP","AND","OR","XOR","NOT","IND","MIN","MAX","ABS","NEG","DUP","JNE",
-                            "SWAP","GEN","PICK","DPTH","PC","SETPC","SQRT","EXP","TICK","DROP","OVER",
-                            "SHL","SHR","BIT","MLOAD","MSTORE","GLOAD","GSTORE"]
+                RV_NAMES = ["ADD","SUB","SLL","SLT","SLTU","XOR","SRL","SRA","OR","AND",
+                            "ADDI","SLTI","SLTIU","XORI","ORI","ANDI","SLLI","SRLI","SRAI",
+                            "LW","SW","LB","SB",
+                            "BEQ","BNE","BLT","BGE","BLTU","BGEU",
+                            "JAL","JALR","LUI","AUIPC","ECALL","EBREAK"]
                 g = sentinel.genome
                 decoded = []
-                for i in range(0, min(len(g), 54), 3):
-                    if i + 2 >= len(g):
-                        break
-                    op = g[i] % Op.TOTAL
-                    a1 = g[i+1] % 256
-                    a2 = g[i+2] % 256
-                    decoded.append(f"{OP_NAMES[op]}({a1},{a2})")
+                for i in range(min(len(g), 18)):
+                    inst = g[i]
+                    opcode = inst & 0x7F
+                    rd = (inst >> 7) & 0x1F
+                    name = f"rv32({(inst>>2)&0x1F})" if opcode in (0x37,0x17) else f"rv32 [{opcode:02x}]"
+                    decoded.append(f"{inst:08x}")
                 prog = " ".join(decoded[:18])
                 lines.append(
                     f"  sentinel: gen={sentinel.generation} age={sentinel.age} "
@@ -1718,7 +1830,7 @@ class World:
 
 
 async def main():
-    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, MUTATION_RATE, VM_MEM_SIZE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY, MAX_MOVEMENT_SPEED, MAX_AGE, SHARED_MEM_ENABLED, SHARED_MEM_SIZE, NUM_REGS
+    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, MUTATION_RATE, VM_MEM_SIZE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY, MAX_MOVEMENT_SPEED, MAX_AGE, SHARED_MEM_ENABLED, SHARED_MEM_SIZE
     parser = argparse.ArgumentParser(description="VM-genome evolutionary ecosystem")
     parser.add_argument("--volume", type=float, default=SOUND_VOLUME)
     parser.add_argument("--no-sound", action="store_true")
@@ -1737,8 +1849,6 @@ async def main():
                     help="enable experimental shared memory and symbolic signal features (GLOAD/GSTORE/SYMEMIT)")
     parser.add_argument("--shared-mem-size", type=int, default=SHARED_MEM_SIZE,
                     help="number of shared memory slots (default: %(default)s)")
-    parser.add_argument("--n-registers", type=int, default=NUM_REGS,
-                    help="number of VM registers (default: %(default)s)")
     parser.add_argument("--mutation-rate", type=float, default=MUTATION_RATE,
                     help="per-byte mutation rate during reproduction (default: %(default)s)")
     parser.add_argument("--vm-memory", type=int, default=VM_MEM_SIZE,
@@ -1761,7 +1871,6 @@ async def main():
         MAX_MOVEMENT_SPEED = args.max_movement_speed
     if args.max_age is not None:
         MAX_AGE = args.max_age if args.max_age > 0 else float('inf')
-    NUM_REGS = max(1, min(64, args.n_registers))
     MUTATION_RATE = max(0.0, min(1.0, args.mutation_rate))
     VM_MEM_SIZE = max(1, min(256, args.vm_memory))
     continuous = args.continuous
@@ -1820,20 +1929,10 @@ async def main():
         if world.organisms:
             best = max(world.organisms, key=lambda o: o.generation)
             if best.generation > 0:
-                OP_NAMES = ["NOP","MOV","ADD","SUB","MUL","DIV","JMP","JZ","JG","JL",
-                            "SENSE","ACT","PUSH","POP","CALL","RET","HALT","RAND","ENERGY",
-                            "MOD","CMP","AND","OR","XOR","NOT","IND","MIN","MAX","ABS","NEG","DUP","JNE",
-                            "SWAP","GEN","PICK","DPTH","PC","SETPC","SQRT","EXP","TICK","DROP","OVER",
-                            "SHL","SHR","BIT","MLOAD","MSTORE","GLOAD","GSTORE"]
                 g = best.genome
                 decoded = []
-                for i in range(0, min(len(g), 54), 3):
-                    if i + 2 >= len(g):
-                        break
-                    op = g[i] % Op.TOTAL
-                    a1 = g[i+1] % 256
-                    a2 = g[i+2] % 256
-                    decoded.append(f"{OP_NAMES[op]}({a1},{a2})")
+                for i in range(min(len(g), 18)):
+                    decoded.append(f"{g[i]:08x}")
                 prog = " ".join(decoded[:18])
                 print(f"  Best VM: gen={best.generation} age={best.age:.0f} "
                       f"⚡={best.energy:.1f} wt={best.weight:.2f} len={len(best.genome)} "
