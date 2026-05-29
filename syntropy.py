@@ -47,6 +47,7 @@ MIGRATION_INTERVAL = (80, 150)
 MIGRATION_BATCH = (3, 8)
 TICK_RATE = 0.06
 MUTATION_RATE = 0.06
+VM_MEM_SIZE = 16
 
 RESOURCE_TYPES = {
     "food":  {"value": 1.5, "symbol": "·", "weight": 0.65},
@@ -172,7 +173,7 @@ class GenomeVM:
     stack: List[int] = field(default_factory=list)
     running: bool = True
     instr_count: int = 0
-    mem: List[float] = field(default_factory=lambda: [0.0] * 16)  # persistent across ticks
+    mem: List[float] = field(default_factory=lambda: [0.0] * VM_MEM_SIZE)
 
     def clone_mutated(self, rate: float = 0.06) -> 'GenomeVM':
         ng = list(self.genome)
@@ -355,9 +356,9 @@ class GenomeVM:
             elif op == Op.BIT:
                 self._sr(a2 % NUM_REGS, 1.0 if (int(abs(rv)) >> (a1 & 7)) & 1 else 0.0)
             elif op == Op.MLOAD:
-                self._sr(ridx, self.mem[a2 % 16])
+                self._sr(ridx, self.mem[a2 % VM_MEM_SIZE])
             elif op == Op.MSTORE:
-                self.mem[a2 % 16] = rv
+                self.mem[a2 % VM_MEM_SIZE] = rv
             elif op == Op.GLOAD:
                 if shared_mem is not None:
                     self._sr(ridx, shared_mem[a2 % len(shared_mem)])
@@ -772,7 +773,7 @@ class World:
         )
         org.vm.genome = ga
         if parent_mem is not None:
-            for i in range(min(len(parent_mem), 16)):
+            for i in range(min(len(parent_mem), VM_MEM_SIZE)):
                 org.vm.mem[i] = parent_mem[i] + random.gauss(0, 0.05)
         self.organisms.append(org)
         self.all_genomes_seen.add(tuple(ga))
@@ -1717,7 +1718,7 @@ class World:
 
 
 async def main():
-    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, MUTATION_RATE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY, MAX_MOVEMENT_SPEED, MAX_AGE, SHARED_MEM_ENABLED, SHARED_MEM_SIZE, NUM_REGS
+    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, MUTATION_RATE, VM_MEM_SIZE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY, MAX_MOVEMENT_SPEED, MAX_AGE, SHARED_MEM_ENABLED, SHARED_MEM_SIZE, NUM_REGS
     parser = argparse.ArgumentParser(description="VM-genome evolutionary ecosystem")
     parser.add_argument("--volume", type=float, default=SOUND_VOLUME)
     parser.add_argument("--no-sound", action="store_true")
@@ -1740,6 +1741,8 @@ async def main():
                     help="number of VM registers (default: %(default)s)")
     parser.add_argument("--mutation-rate", type=float, default=MUTATION_RATE,
                     help="per-byte mutation rate during reproduction (default: %(default)s)")
+    parser.add_argument("--vm-memory", type=int, default=VM_MEM_SIZE,
+                    help="per-organism VM local memory slots (default: %(default)s)")
     args = parser.parse_args()
     if args.no_sound:
         SOUND_ENABLED = False
@@ -1760,6 +1763,7 @@ async def main():
         MAX_AGE = args.max_age if args.max_age > 0 else float('inf')
     NUM_REGS = max(1, min(64, args.n_registers))
     MUTATION_RATE = max(0.0, min(1.0, args.mutation_rate))
+    VM_MEM_SIZE = max(1, min(256, args.vm_memory))
     continuous = args.continuous
 
     run_count = 0
