@@ -23,6 +23,8 @@ EXTINCTION_LOG_FILE = "extinction.json"
 SOUND_ENABLED = True
 SOUND_VOLUME = 0.3
 SHARED_MEM_ENABLED = False   # experimental: shared memory + symbolic signals (opt-in)
+SHARED_MEM_SIZE = 64
+FIGHT_OVERLAP_ENABLED = False
 
 WIDTH = 72
 HEIGHT = 26
@@ -40,9 +42,11 @@ ENV_SHIFT_INTERVAL = (30, 60)
 DAY_LENGTH = 120
 MAX_SYSTEM_ENERGY = 200
 MAX_MOVEMENT_SPEED = 0
+MAX_AGE = 0  # 0 = use existing per-organism age limit
 MIGRATION_INTERVAL = (80, 150)
 MIGRATION_BATCH = (3, 8)
 TICK_RATE = 0.06
+MUTATION_RATE = 0.06
 
 RESOURCE_TYPES = {
     "food":  {"value": 1.5, "symbol": "·", "weight": 0.65},
@@ -115,23 +119,31 @@ class Sensor:
     TRACE_DX, TRACE_DY = 20, 21
     SIGNAL = 22
     SYMBOL_ID, SYMBOL_VAL = 23, 24   # typed symbol channel
+    FOOD_DIR = 25   # 0=N, 1=E, 2=S, 3=W to nearest food
+    ORG_DIR = 26    # 0=N, 1=E, 2=S, 3=W to nearest organism
+    FACING = 27     # last direction the organism acted in
 
 class Action:
-    MOVE_N, MOVE_S, MOVE_E, MOVE_W = 0, 1, 2, 3
-    MOVE_TOWARD_FOOD, MOVE_AWAY_ORG = 4, 5
-    EAT, ATTACK, REPRODUCE = 6, 7, 8
-    REST, SOUND = 9, 10
-    EMIT = 11
-    SYMEMIT = 12   # broadcast (symbol_id, value) pair to nearby cells
-    TOTAL = 13
+    MOVE = 0     # move 1 cell in direction (arg % 4): 0=N, 1=E, 2=S, 3=W
+    ATTACK = 1   # attack adjacent cell in direction (arg % 4)
+    EAT = 2      # eat resource at current position
+    REPRODUCE = 3
+    REST = 4
+    SOUND = 5
+    EMIT = 6
+    SYMEMIT = 7  # broadcast (symbol_id, value) pair to nearby cells
+    HGT = 8      # swap a genome byte with a neighboring organism
+    TOTAL = 9
 
-NUM_REGS = 4
-NUM_SENSORS = 25
-NUM_ACTIONS = 13
+NUM_REGS = 4  # can be overridden via --n-registers CLI flag
+NUM_SENSORS = 28
+NUM_ACTIONS = 9
+
+DIR_VECS = [(0, -1), (1, 0), (0, 1), (-1, 0)]  # N, E, S, W
+DIR_GLYPHS = ["▲", "▶", "▼", "◀"]
 
 
 
-GLYPH_SET = "●◆▲■★✦⬟⬢◈◎◉"
 COLORS = [
     "\033[31m", "\033[33m", "\033[32m", "\033[36m",
     "\033[34m", "\033[35m", "\033[91m", "\033[95m",
@@ -182,6 +194,13 @@ class GenomeVM:
 
     def _rg(self, v: int) -> float:
         return self.regs[v % NUM_REGS]
+
+    @staticmethod
+    def _to_float(x):
+        try:
+            return float(x)
+        except OverflowError:
+            return float('inf') if x > 0 else float('-inf')
 
     def _sr(self, v: int, val: float):
         self.regs[v % NUM_REGS] = val
@@ -254,7 +273,7 @@ class GenomeVM:
                 self.stack.append(int(rv))
             elif op == Op.POP:
                 if self.stack:
-                    self._sr(ridx, float(self.stack.pop()))
+                    self._sr(ridx, self._to_float(self.stack.pop()))
             elif op == Op.CALL:
                 self.stack.append(self.pc)
                 self.pc = (a1 % max(3, glen)) // 3 * 3
@@ -275,13 +294,13 @@ class GenomeVM:
             elif op == Op.CMP:
                 self._sr(ridx, 1.0 if rv > v else (-1.0 if rv < v else 0.0))
             elif op == Op.AND:
-                self._sr(ridx, float(int(rv) & int(v)))
+                self._sr(ridx, self._to_float(int(rv) & int(v)))
             elif op == Op.OR:
-                self._sr(ridx, float(int(rv) | int(v)))
+                self._sr(ridx, self._to_float(int(rv) | int(v)))
             elif op == Op.XOR:
-                self._sr(ridx, float(int(rv) ^ int(v)))
+                self._sr(ridx, self._to_float(int(rv) ^ int(v)))
             elif op == Op.NOT:
-                self._sr(ridx, float(~int(rv)))
+                self._sr(ridx, self._to_float(~int(rv)))
             elif op == Op.IND:
                 self._sr(ridx, self._rg(int(v) % NUM_REGS))
             elif op == Op.MIN:
@@ -303,17 +322,17 @@ class GenomeVM:
                 self.regs[ridx], self.regs[r2] = self.regs[r2], self.regs[ridx]
             elif op == Op.GEN:
                 idx = a1 % max(1, len(self.genome))
-                self._sr(a2 % NUM_REGS, float(self.genome[idx]))
+                self._sr(a2 % NUM_REGS, self._to_float(self.genome[idx]))
             elif op == Op.PICK:
                 if self.stack:
                     d = a1 % len(self.stack)
-                    self._sr(a2 % NUM_REGS, float(self.stack[-d - 1]))
+                    self._sr(a2 % NUM_REGS, self._to_float(self.stack[-d - 1]))
                 else:
                     self._sr(a2 % NUM_REGS, 0.0)
             elif op == Op.DEPTH:
-                self._sr(a2 % NUM_REGS, float(len(self.stack)))
+                self._sr(a2 % NUM_REGS, self._to_float(len(self.stack)))
             elif op == Op.PC:
-                self._sr(a2 % NUM_REGS, float(self.pc))
+                self._sr(a2 % NUM_REGS, self._to_float(self.pc))
             elif op == Op.SETPC:
                 new_pc = int(abs(rv))
                 self.pc = (new_pc % max(3, glen)) // 3 * 3
@@ -322,7 +341,7 @@ class GenomeVM:
             elif op == Op.EXP:
                 self._sr(a2 % NUM_REGS, math.exp(max(-10.0, min(10.0, rv))))
             elif op == Op.TICK:
-                self._sr(a2 % NUM_REGS, float(tick))
+                self._sr(a2 % NUM_REGS, self._to_float(tick))
             elif op == Op.DROP:
                 if self.stack:
                     self.stack.pop()
@@ -330,9 +349,9 @@ class GenomeVM:
                 if len(self.stack) >= 2:
                     self.stack.append(self.stack[-2])
             elif op == Op.SHL:
-                self._sr(ridx, float(int(rv) << (a2 % 16)))
+                self._sr(ridx, self._to_float(int(rv) << (a2 % 16)))
             elif op == Op.SHR:
-                self._sr(ridx, float(int(rv) >> (a2 % 16)))
+                self._sr(ridx, self._to_float(int(rv) >> (a2 % 16)))
             elif op == Op.BIT:
                 self._sr(a2 % NUM_REGS, 1.0 if (int(abs(rv)) >> (a1 & 7)) & 1 else 0.0)
             elif op == Op.MLOAD:
@@ -341,10 +360,10 @@ class GenomeVM:
                 self.mem[a2 % 16] = rv
             elif op == Op.GLOAD:
                 if shared_mem is not None:
-                    self._sr(ridx, shared_mem[a2 % 64])
+                    self._sr(ridx, shared_mem[a2 % len(shared_mem)])
             elif op == Op.GSTORE:
                 if shared_mem is not None:
-                    shared_mem[a2 % 64] = rv
+                    shared_mem[a2 % len(shared_mem)] = rv
 
         return actions
 
@@ -540,6 +559,7 @@ class Organism:
     vol_treble: float = 0.0
     action_counts: Dict[int, float] = field(default_factory=dict)
     last_regs: List[float] = field(default_factory=lambda: [0.0] * NUM_REGS)
+    facing: int = 0  # 0=N, 1=E, 2=S, 3=W; last direction acted in
 
     @property
     def genome(self) -> list:
@@ -558,6 +578,13 @@ def _wy(y: int) -> int:
     return max(0, min(HEIGHT - 1, y)) if HEIGHT else 0
 
 
+def _dir_to(dx: int, dy: int) -> int:
+    if abs(dx) >= abs(dy):
+        return 1 if dx > 0 else 3  # E, W
+    else:
+        return 2 if dy > 0 else 0  # S, N
+
+
 _next_id = 0
 
 
@@ -567,7 +594,7 @@ def _next_oid() -> int:
     return _next_id
 
 
-def _mutate_genome(genome: List[int], rate: float = 0.06) -> List[int]:
+def _mutate_genome(genome: List[int], rate: float = MUTATION_RATE) -> List[int]:
     ng = list(genome)
     for i in range(len(ng)):
         if random.random() < rate:
@@ -594,6 +621,7 @@ class World:
         self.next_id = 0
         self.shift_timer = random.randint(*ENV_SHIFT_INTERVAL)
         self.events: List[str] = []
+        self.action_log: List[str] = []
         self.extinction_log: List[str] = []
         self.pop_history: List[int] = []
         self.fitness_history: List[float] = []
@@ -622,7 +650,7 @@ class World:
         self.territory: Dict[Tuple[int, int], Dict[int, int]] = {}
         self.traces: Dict[Tuple[int, int], float] = {}
         self.signal_buffers: Dict[Tuple[int, int], List[float]] = {}
-        self.shared_mem: Optional[List[float]] = [0.0] * 64 if SHARED_MEM_ENABLED else None
+        self.shared_mem: Optional[List[float]] = [0.0] * SHARED_MEM_SIZE if SHARED_MEM_ENABLED else None
         self.symbol_buffers: Dict[Tuple[int, int], Dict[int, float]] = {}  # typed symbol channel
         self.death_stats: Dict[str, int] = {
             "starvation": 0, "predation": 0, "fighting": 0,
@@ -663,6 +691,10 @@ class World:
         if tone:
             freq, dur = tone
             self.mixer.set_stinger(event_type, freq, SOUND_VOLUME, dur)
+
+    def _log_action(self, msg: str):
+        self.action_log.append(msg)
+        self.action_log = self.action_log[-12:]
 
     def _log_extinction(self, etype: str, pop: int):
         orgs = self.organisms
@@ -778,8 +810,10 @@ class World:
             senses[Sensor.FOOD_X] = float(best_food[0])
             senses[Sensor.FOOD_Y] = float(best_food[1])
             senses[Sensor.FOOD_DIST] = float(best_fd)
+            senses[Sensor.FOOD_DIR] = float(_dir_to(best_food[0] - org.x, best_food[1] - org.y))
         else:
             senses[Sensor.FOOD_DIST] = 99.0
+            senses[Sensor.FOOD_DIR] = 0.0
 
         best_org = None
         best_od = 999
@@ -794,8 +828,10 @@ class World:
             senses[Sensor.ORG_X] = float(best_org.x)
             senses[Sensor.ORG_Y] = float(best_org.y)
             senses[Sensor.ORG_DIST] = float(best_od)
+            senses[Sensor.ORG_DIR] = float(_dir_to(best_org.x - org.x, best_org.y - org.y))
         else:
             senses[Sensor.ORG_DIST] = 99.0
+            senses[Sensor.ORG_DIR] = 0.0
 
         phase = (self.tick % DAY_LENGTH) / DAY_LENGTH
         daylight = self._daylight_at(org.x, phase)
@@ -844,6 +880,7 @@ class World:
         else:
             senses[Sensor.SYMBOL_ID] = 0.0
             senses[Sensor.SYMBOL_VAL] = 0.0
+        senses[Sensor.FACING] = float(org.facing)
         return senses
 
     def apply_action(self, org: Organism, action_id: int, _arg: int, speed: int = 1):
@@ -851,54 +888,14 @@ class World:
         move_cost = 0.02 * dissipation * speed * org.weight
         weight_burn = 0.01 * speed
 
-        if action_id == Action.MOVE_N:
-            org.y = _wy(org.y - 1)
+        if action_id == Action.MOVE:
+            dx, dy = DIR_VECS[_arg % 4]
+            org.x = _wx(org.x + dx)
+            org.y = _wy(org.y + dy)
             org.energy -= move_cost
             org.weight = max(0.0, org.weight - weight_burn)
-        elif action_id == Action.MOVE_S:
-            org.y = _wy(org.y + 1)
-            org.energy -= move_cost
-            org.weight = max(0.0, org.weight - weight_burn)
-        elif action_id == Action.MOVE_E:
-            org.x = _wx(org.x + 1)
-            org.energy -= move_cost
-            org.weight = max(0.0, org.weight - weight_burn)
-        elif action_id == Action.MOVE_W:
-            org.x = _wx(org.x - 1)
-            org.energy -= move_cost
-            org.weight = max(0.0, org.weight - weight_burn)
-
-        elif action_id == Action.MOVE_TOWARD_FOOD:
-            best = None
-            best_d = 999
-            for (fx, fy) in self.resources:
-                d = _tdist(org.x, fx, WIDTH) + _tdist(org.y, fy, HEIGHT)
-                if d < best_d:
-                    best_d = d
-                    best = (fx, fy)
-            if best:
-                fx, fy = best
-                dx = 1 if fx > org.x else -1 if fx < org.x else 0
-                dy = 1 if fy > org.y else -1 if fy < org.y else 0
-                org.x = _wx(org.x + dx)
-                org.y = _wy(org.y + dy)
-                if dx or dy:
-                    org.energy -= move_cost
-                    org.weight = max(0.0, org.weight - weight_burn)
-
-        elif action_id == Action.MOVE_AWAY_ORG:
-            for other in self.organisms:
-                if other is org:
-                    continue
-                d = _tdist(org.x, other.x, WIDTH) + _tdist(org.y, other.y, HEIGHT)
-                if d <= 3:
-                    fx = org.x + (org.x - other.x)
-                    fy = org.y + (org.y - other.y)
-                    org.x = _wx(fx)
-                    org.y = _wy(fy)
-                    org.energy -= move_cost
-                    org.weight = max(0.0, org.weight - weight_burn)
-                    break
+            org.facing = _arg % 4
+            self._log_action(f"O{org.id} {DIR_GLYPHS[org.facing]}")
 
         elif action_id == Action.EAT:
             pos = (org.x, org.y)
@@ -907,6 +904,7 @@ class World:
                 val = RESOURCE_TYPES[rtype]["value"]
                 org.energy += val
                 org.weight += val * 0.3
+                self._log_action(f"O{org.id} +{rtype}")
             else:
                 for other in self.organisms:
                     if other is org or other.energy <= 0:
@@ -918,20 +916,28 @@ class World:
                         org.weight += other.weight * 0.6
                         other.cause_of_death = "predation"
                         other.energy = 0
+                        self._log_action(f"O{org.id} ⊗ O{other.id}")
                         break
 
         elif action_id == Action.ATTACK:
+            dx, dy = DIR_VECS[_arg % 4]
+            tx, ty = _wx(org.x + dx), _wy(org.y + dy)
+            hit = None
             for other in self.organisms:
                 if other is org:
                     continue
-                if other.x == org.x and other.y == org.y and org.weight > other.weight:
+                if other.x == tx and other.y == ty and org.weight > other.weight:
                     power = max(0.1, org.energy) * 0.3
                     other.energy -= power
                     if other.energy <= 0:
                         other.cause_of_death = "predation"
                         org.energy += other.energy * 0.5
                         org.weight += other.weight * 0.5
+                    hit = other
                     break
+            org.facing = _arg % 4
+            if hit:
+                self._log_action(f"O{org.id} ✗ O{hit.id}")
 
         elif action_id == Action.REPRODUCE:
             if org.energy < ENERGY_COST_PER_CHILD * 0.6:
@@ -964,19 +970,20 @@ class World:
                 cross = org.vm.crossover(mate.vm)
                 child_ga = _mutate_genome(cross.genome)
                 child_gb = _mutate_genome(cross.genome)
-                self._spawn(nx, ny, child_ga,
-                            genome_b=child_gb,
-                            active_bank=random.randint(0, 1),
-                            energy=2.5, generation=child_g,
-                            parent_mem=org.vm.mem)
+                child = self._spawn(nx, ny, child_ga,
+                                    genome_b=child_gb,
+                                    active_bank=random.randint(0, 1),
+                                    energy=2.5, generation=child_g,
+                                    parent_mem=org.vm.mem)
+                self._log_action(f"O{org.id} ♥ O{child.id}")
             else:
                 cost = ENERGY_COST_PER_CHILD * 0.6
                 org.energy -= cost
                 child_ga = _mutate_genome(org.genome_a)
                 child_gb = _mutate_genome(org.genome_b)
-                self._spawn(nx, ny, child_ga,
-                            genome_b=child_gb,
-                            active_bank=random.randint(0, 1),
+                child = self._spawn(nx, ny, child_ga,
+                                    genome_b=child_gb,
+                                    active_bank=random.randint(0, 1),
                             energy=2.0, generation=child_g,
                             parent_mem=org.vm.mem)
                 if child_g > self.max_gen_ever:
@@ -1024,6 +1031,15 @@ class World:
                     self.symbol_buffers[pos][sym_id] = (
                         self.symbol_buffers[pos].get(sym_id, 0.0) + val * 0.5
                     )
+
+        elif action_id == Action.HGT:
+            for other in self.organisms:
+                if other is org:
+                    continue
+                if _tdist(other.x, org.x, WIDTH) <= 1 and _tdist(other.y, org.y, HEIGHT) <= 1:
+                    idx = _arg % min(len(org.genome), len(other.genome))
+                    org.vm.genome[idx], other.vm.genome[idx] = other.vm.genome[idx], org.vm.genome[idx]
+                    break
 
     async def step(self):
         self.tick += 1
@@ -1130,11 +1146,13 @@ class World:
                 if org.energy >= 3.0:
                     org.torpor = False
                     torpid = False
+                    self._log_action(f"O{org.id} wake")
                 else:
                     torpid = True
             elif org.energy <= 0.5:
                 org.torpor = True
                 torpid = True
+                self._log_action(f"O{org.id} torpor")
             else:
                 torpid = False
 
@@ -1145,19 +1163,20 @@ class World:
                     if org.energy < 0.8 and org.age > 5:
                         org.awake = False
                         org.sleep_timer = random.randint(3, 8)
+                        self._log_action(f"O{org.id} sleep")
                 else:
                     org.sleep_timer -= 1
                     org.energy += 0.08
                     if org.sleep_timer <= 0 or org.energy > 3.0:
                         org.awake = True
+                        self._log_action(f"O{org.id} wake")
             asleep = not org.awake and not torpid
 
             # Apply VM actions
             if not torpid and not asleep:
                 moved_n = 0
                 for act_id, arg, _intensity in actions:
-                    is_move = act_id in (Action.MOVE_N, Action.MOVE_S, Action.MOVE_E,
-                                         Action.MOVE_W, Action.MOVE_TOWARD_FOOD, Action.MOVE_AWAY_ORG)
+                    is_move = act_id == Action.MOVE
                     if is_move and MAX_MOVEMENT_SPEED > 0 and moved_n >= MAX_MOVEMENT_SPEED:
                         continue
                     self.apply_action(org, act_id, arg, speed=moved_n + 1)
@@ -1188,8 +1207,7 @@ class World:
             # Genome-determined drift when VM produces no movement actions
             if not torpid and not asleep:
                 moved = any(
-                    a[0] in (Action.MOVE_N, Action.MOVE_S, Action.MOVE_E,
-                             Action.MOVE_W, Action.MOVE_TOWARD_FOOD, Action.MOVE_AWAY_ORG)
+                    a[0] == Action.MOVE
                     for a in actions
                 )
                 if not moved:
@@ -1234,7 +1252,7 @@ class World:
                     org.energy -= 0.02 * min(3, foreign)
 
             # Fight overlapping organisms
-            if not torpid:
+            if FIGHT_OVERLAP_ENABLED and not torpid:
                 for other in self.organisms:
                     if other is org or other.id in dead:
                         continue
@@ -1257,16 +1275,6 @@ class World:
             if org.id in dead:
                 continue
 
-            # Weak auto-eat at 30% efficiency (bootstrap only)
-            if not torpid:
-                pos = (org.x, org.y)
-                if pos in self.resources:
-                    rtype = self.resources.pop(pos)
-                    age_bonus = min(org.age, 20) / 20.0 * 0.2
-                    val = RESOURCE_TYPES[rtype]["value"]
-                    org.energy += val * (0.3 + age_bonus)
-                    org.weight += val * 0.1
-
             # Metabolic cost
             base_cost = SUMMER_BASE_COST if self.season == "summer" else WINTER_BASE_COST
             mult = 0.1 if torpid else 1.0
@@ -1283,18 +1291,8 @@ class World:
                 dead.add(org.id)
                 continue
 
-            # HGT: horizontal genome transfer
-            if not torpid and random.random() < 0.02:
-                for other in self.organisms:
-                    if other is org or other.id in dead:
-                        continue
-                    if _tdist(other.x, org.x, WIDTH) <= 1 and _tdist(other.y, org.y, HEIGHT) <= 1:
-                        i = random.randrange(min(len(org.genome), len(other.genome)))
-                        org.vm.genome[i], other.vm.genome[i] = other.vm.genome[i], org.vm.genome[i]
-                        break
-
             # Random spontaneous mutation
-            if random.random() < 0.004:
+            if random.random() < MUTATION_RATE * 0.0667:
                 i = random.randrange(len(org.genome))
                 org.vm.genome[i] = max(0, min(255, org.vm.genome[i] + random.choice([-1, 1])))
 
@@ -1336,7 +1334,10 @@ class World:
                 continue
 
             # Old age
-            max_age = 120 + (org.vm.instr_count % 100)
+            if MAX_AGE == 0:
+                max_age = 120 + (org.vm.instr_count % 100)
+            else:
+                max_age = MAX_AGE
             if org.age > max_age:
                 org.cause_of_death = "old_age"
                 dead.add(org.id)
@@ -1359,7 +1360,7 @@ class World:
                     self.apply_action(org, Action.REPRODUCE, 0)
 
             # Mutation pressure from reproduction overhead
-            if org.energy >= repro_thresh * 1.5 and random.random() < 0.03:
+            if org.energy >= repro_thresh * 1.5 and random.random() < MUTATION_RATE * 0.5:
                 target = org.genome_a if random.random() < 0.5 else org.genome_b
                 if len(target) < 600 and random.random() < 0.5:
                     idx = (random.randrange(0, len(target) + 1) // 3) * 3
@@ -1373,10 +1374,9 @@ class World:
         for o in self.organisms:
             if o.id in dead:
                 dead_list.append(o)
-                if o.cause_of_death:
-                    self.death_stats[o.cause_of_death] = self.death_stats.get(o.cause_of_death, 0) + 1
-                else:
-                    self.death_stats["unknown"] = self.death_stats.get("unknown", 0) + 1
+                cause = o.cause_of_death or "unknown"
+                self.death_stats[cause] = self.death_stats.get(cause, 0) + 1
+                self._log_action(f"O{o.id} ✝ {cause}")
             else:
                 kept.append(o)
         self.organisms = kept
@@ -1571,10 +1571,10 @@ class World:
         sentinel_id = sentinel.id if sentinel else -1
 
         for org in self.organisms:
-            hue = (org.id + org.generation) % len(GLYPH_SET)
-            glyph = GLYPH_SET[hue]
-            color = COLORS[hue % len(COLORS)]
+            color = COLORS[(org.id + org.generation) % len(COLORS)]
             dl = self._daylight_at(org.x, phase)
+
+            glyph = DIR_GLYPHS[org.facing % 4]
 
             if org.id == sentinel_id and org.generation > 0:
                 grid[org.y][org.x] = f"{BOLD}\033[47m\033[30m{glyph}{RESET}"
@@ -1717,7 +1717,7 @@ class World:
 
 
 async def main():
-    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY, MAX_MOVEMENT_SPEED, SHARED_MEM_ENABLED
+    global SOUND_ENABLED, SOUND_VOLUME, TICK_RATE, MUTATION_RATE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY, MAX_MOVEMENT_SPEED, MAX_AGE, SHARED_MEM_ENABLED, SHARED_MEM_SIZE, NUM_REGS
     parser = argparse.ArgumentParser(description="VM-genome evolutionary ecosystem")
     parser.add_argument("--volume", type=float, default=SOUND_VOLUME)
     parser.add_argument("--no-sound", action="store_true")
@@ -1729,14 +1729,23 @@ async def main():
     parser.add_argument("--max-energy", type=float, default=None)
     parser.add_argument("--max-movement-speed", type=int, default=0,
                     help="max movement actions per tick per organism (0=unlimited)")
+    parser.add_argument("--max-age", type=float, default=None,
+                    help="max organism age in ticks (0 = unlimited, default = per-organism VM-based limit)")
     parser.add_argument("--continuous", action="store_true")
     parser.add_argument("--shared-memory", action="store_true",
                     help="enable experimental shared memory and symbolic signal features (GLOAD/GSTORE/SYMEMIT)")
+    parser.add_argument("--shared-mem-size", type=int, default=SHARED_MEM_SIZE,
+                    help="number of shared memory slots (default: %(default)s)")
+    parser.add_argument("--n-registers", type=int, default=NUM_REGS,
+                    help="number of VM registers (default: %(default)s)")
+    parser.add_argument("--mutation-rate", type=float, default=MUTATION_RATE,
+                    help="per-byte mutation rate during reproduction (default: %(default)s)")
     args = parser.parse_args()
     if args.no_sound:
         SOUND_ENABLED = False
     if args.shared_memory:
         SHARED_MEM_ENABLED = True
+    SHARED_MEM_SIZE = max(1, args.shared_mem_size)
     SOUND_VOLUME = max(0.0, min(1.0, args.volume))
     TICK_RATE = max(0.01, args.tick_rate)
     EXTINCTION_LOG_FILE = args.log
@@ -1747,6 +1756,10 @@ async def main():
         MAX_SYSTEM_ENERGY = max(10, args.max_energy)
     if args.max_movement_speed > 0:
         MAX_MOVEMENT_SPEED = args.max_movement_speed
+    if args.max_age is not None:
+        MAX_AGE = args.max_age if args.max_age > 0 else float('inf')
+    NUM_REGS = max(1, min(64, args.n_registers))
+    MUTATION_RATE = max(0.0, min(1.0, args.mutation_rate))
     continuous = args.continuous
 
     run_count = 0
