@@ -1,6 +1,6 @@
 # syntropy — self-evolving ecosystem in your terminal
 
-Digital organisms run Turing-complete VM programs (46 opcodes) on a shared 2D grid.
+Digital organisms run RISC-V RV32I programs on a shared 2D grid.
 No fitness function. No selection pressure. No objective. Evolution emerges bottom-up.
 
 ![syntropy screenshot](image.png)
@@ -17,46 +17,84 @@ Ctrl+C to stop. Extinction summary on exit.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--seed N` | time | Random seed |
-| `--width N` | 72 | Grid width |
-| `--height N` | 26 | Grid height |
-| `--tick-rate N` | 0.06 | Seconds per tick |
+| `--seed N` | 42 | Random seed |
+| `--width N` | 72 | Grid width (16–256) |
+| `--height N` | 26 | Grid height (8–64) |
+| `--tick-rate N` | 0.06 | Seconds per tick (min 0.01) |
 | `--volume N` | 0.3 | Sound volume 0–1 |
 | `--no-sound` | — | Disable audio |
+| `--no-environmental-sounds` | — | Disable ambient audio only |
+| `--initial-population N` | 1 | Starting organisms |
+| `--day-length N` | 120 | Ticks per day/night cycle |
 | `--max-energy N` | 200 | System-wide energy cap |
 | `--max-movement-speed N` | 0 | Max moves/tick/org (0=unlimited) |
+| `--max-age N` | per-organism | Max age in ticks (0=unlimited) |
+| `--mutation-rate N` | 0.06 | Per-word mutation probability at reproduction |
+| `--vm-memory N` | 16 | Persistent local memory slots per organism (1–256) |
+| `--n-registers N` | 32 | Usable VM registers (1–32; higher indices alias modulo N) |
+| `--no-register-scan` | — | Actions only from explicit `ACT` ECALLs / action-buffer stores |
+| `--shared-memory` | — | Enable shared world memory + symbol channel (GLOAD/GSTORE/SYMEMIT) |
+| `--shared-mem-size N` | 64 | Shared memory slots |
 | `--continuous` | — | Auto-restart on extinction |
 | `--log FILE` | extinction.json | Extinction log path |
 
 ## Architecture
 
-### GenomeVM — 46 opcodes
+### Genome VM — RISC-V RV32I
 
-Programs are lists of bytes grouped in 3-byte instructions: `[opcode, a1, a2]`.
-Execution is async per organism per tick. Energy = gas (budget up to `min(energy×0.4, 8.0)`).
+A genome is a list of 32-bit RV32I instruction words (mutated by bit flips, insertion
+and deletion; recombined by one-point crossover). Each tick an organism's program runs
+from `pc=0` with a gas limit of `clamp(budget×50, 10, 200)` instructions, where
+`budget = min(energy×0.4, 8)`. Instructions implemented: LUI, AUIPC, JAL, JALR,
+BEQ/BNE/BLT/BGE/BLTU/BGEU, LB/LH/LW/LBU/LHU, SB/SH/SW, all OP-IMM and OP
+(register) ALU ops, and ECALL. There is no M extension; unknown encodings are NOPs.
+`x0` is hard-wired to zero. With `--n-registers N` < 32, register indices alias
+modulo N.
 
-| Cat | Opcodes |
-|-----|---------|
-| Flow | NOP, JMP, JZ, JG, JL, JNE, CALL, RET, HALT |
-| Math | MOV, ADD, SUB, MUL, DIV, MIN, MAX, ABS, NEG, MOD, SQRT, EXP |
-| Stack | PUSH, POP, DUP, DROP, SWAP, OVER, PICK, DEPTH |
-| Bit | AND, OR, XOR, NOT, SHL, SHR, BIT |
-| Compare | CMP |
-| Random | RAND |
-| Reg | IND, GEN, PC, SETPC, TICK |
-| I/O | SENSE, ACT |
-| Energy | ENERGY |
-| Memory | MLOAD, MSTORE (16-slot persistent per-organism), GLOAD, GSTORE (64-slot shared world memory) |
+**Memory map** (4 KiB, rebuilt each tick):
 
-### Sensors (25)
+| Range | Purpose |
+|-------|---------|
+| `0x000–0x3FF` | Local memory (`--vm-memory` int32 slots). Persisted on the organism between ticks and inherited by offspring |
+| `0x400–0x4FF` | Sensor inputs, int32, value × 1000 (read-only to the host) |
+| `0x500–0x53F` | Action buffer: 16 words, `act_id | arg<<8` |
+| `0x544` / `0x548` | Remaining budget (×100) / current tick |
 
-Position, resources (food distance/direction), temperature, pressure, moisture, daylight,
-organisms (density, distance, direction), population, predator/prey/kin proximity,
-disease, season, terrain, traces, signals, symbol channel (symbol_id, symbol_val).
+Shared world memory is only reachable through the GLOAD/GSTORE ECALLs (not memory-mapped).
 
-### Actions (13)
+**ECALL ABI** — syscall number in `a7` (x17), arguments in `a0`/`a1`, result in `a0`:
 
-Move N/S/E/W, toward food, away from organisms, EAT, ATTACK, REPRODUCE, REST, SOUND, EMIT, SYMEMIT.
+| a7 | Call | Effect |
+|----|------|--------|
+| 0 | SENSE | `a0 = sensor[a0 % 28] × 1000` (NaN→0, saturating) |
+| 1 | ACT | queue action `a0 % 9` with arg `a1 & 0xFF` |
+| 2 | ENERGY | `a0` = remaining budget × 1000 |
+| 3 | HALT | stop this tick |
+| 4 | RAND | `a0 = rand(0..10000)` |
+| 5 | TICK | `a0` = tick number |
+| 6 / 7 | MLOAD / MSTORE | local slot `a0 % vm_memory`; store writes `a1` |
+| 8 / 9 | GLOAD / GSTORE | shared byte slot `a0 % size` (needs `--shared-memory`); store clamps `a1` to 0–255 |
+
+**Action decoding.** After the program runs, actions are collected from (1) the 16-word
+action buffer (every non-zero word, including raw `SW` stores) and (2) unless
+`--no-register-scan` is given, every non-zero register (`act = r & 0xF`, `arg = r>>4 & 0xF`;
+at most 8). Duplicates are merged. The register scan is a bootstrap aid; it makes
+behaviour partly depend on incidental register contents, so use `--no-register-scan` to
+select purely on explicit `ACT` logic.
+
+**Fault isolation.** If an organism's program ever raises, it simply takes no actions that
+tick and `VM faults` is reported in the end-of-run summary; the world keeps running.
+
+### Sensors (28)
+
+Food position/distance/direction, nearest-organism position/distance/direction,
+temperature, daylight, moisture, energy, age, population density, pressure, season,
+latitude, fat, health, recent EAT/ATTACK counts, trace strength and direction, signal,
+symbol id/value, facing.
+
+### Actions (9)
+
+MOVE (dir = arg % 4), ATTACK, EAT, REPRODUCE, REST, SOUND, EMIT, SYMEMIT, HGT.
 
 ### Weight system
 
@@ -67,30 +105,26 @@ Weight = 0 → wasting death.
 
 ### Dual-bank DNA
 
-Two genome banks per organism: `genome_a` (expressed) and `genome_b` (silent backup).
-Active bank selected at birth. Gene conversion (2%/tick) copies a random byte from inactive to active,
-providing automatic repair without explicit opcodes. Each bank mutates independently during reproduction.
+Two genome banks per organism: `genome_a` (default) and `genome_b` (silent backup).
+The active bank is chosen at birth and each bank mutates independently on reproduction.
 
 ### Traces & signals
 
-Organisms deposit pheromones (trace=0.5/tick, decay ×0.95) detectable via TRACE sensor (radius 3).
-EMIT action broadcasts a register value to nearby cells; SIGNAL sensor reads the buffer.
-SYMEMIT broadcasts a typed `(symbol_id, value)` pair; SYMBOL_ID and SYMBOL_VAL sensors read the
-dominant symbol at the organism's cell. Enables typed coordination and proto-language.
-Enables communication, coordination, and memory sharing.
+Organisms deposit pheromone traces (decaying ×0.95, sensed within radius 3). EMIT
+broadcasts a register value to nearby cells (read via the SIGNAL sensor). With
+`--shared-memory`, SYMEMIT broadcasts a typed `(symbol_id, value)` pair read via
+SYMBOL_ID / SYMBOL_VAL.
 
 ### Memory systems
 
-**Per-organism persistent memory** (16 float slots, opcodes MLOAD/MSTORE): survives across ticks
-for the lifetime of the organism. Allows learned state, counters, and context that persists.
+**Per-organism local memory** (`--vm-memory` int32 slots, MLOAD/MSTORE): persists across
+ticks for the organism's lifetime.
 
-**World shared memory** (64 float slots, opcodes GLOAD/GSTORE): a single global blackboard all
-organisms can read and write. Decays slowly (×0.998/tick). Organisms that evolve to coordinate
-through specific slots gain collective knowledge that outlives any individual.
+**Cultural transmission**: on reproduction the parent's local memory is copied to the
+child with small Gaussian noise, a non-genetic inheritance channel.
 
-**Cultural transmission**: on reproduction the parent's 16-slot memory is copied (with small
-Gaussian noise) into the child, creating a non-genetic inheritance channel that complements
-genome mutation. Learned behaviours can propagate across generations without being encoded in DNA.
+**World shared memory** (`--shared-memory`, GLOAD/GSTORE): a global byte blackboard
+(`--shared-mem-size` slots, values clamped to 0–255) that decays by 1 per tick.
 
 ### Per-organism audio
 
@@ -104,7 +138,7 @@ Async mixer with persistent `aplay` process and sample-accurate phase tracking.
 - Summer upkeep 0.06/tick, winter 0.12/tick
 - System-wide energy cap (default 200): total organism energy+fat scaled proportionally when exceeded
 - Energy dissipation above 5.0: `1.0 + max(0, energy-5.0) × 0.15` — anti-hoarding pressure
-- Per-opcode instruction costs: NOP=0.002 to DIV/RAND/SENSE=0.016; SENSE/ACT add variable cost from a1
+- Program length is bounded by the per-tick gas limit (see VM above)
 
 ### Ecology
 
@@ -129,6 +163,20 @@ Async mixer with persistent `aplay` process and sample-accurate phase tracking.
 Status line: Pop, avg energy, avg weight, generation, avg age, species count,
 Shannon diversity, fossils, resources, season, tick, total system energy.
 
+## Tools
+
+- `search.py` — hyperparameter sweep (`--max-energy`, `--max-movement-speed`,
+  `--n-registers`); `--output FILE` saves results including each best genome as
+  `best_genome` (list of RV32 words).
+- `disasm.py FILE` — disassemble the genomes saved by `search.py --output`.
+
+## Tests
+
+```bash
+pip install pytest
+python3 -m pytest tests
+```
+
 ## Requirements
 
-Python 3.10+. No external dependencies.
+Python 3.10+. No runtime dependencies (pytest for tests only).
