@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hyperparameter search for syntropy ecosystem simulation.
 
-Sweeps over --max-energy, --max-movement-speed, --n-registers
+Sweeps over --max-energy, --max-movement-speed, --n-registers (1-32)
 and reports the best configuration by tick-to-extinction.
 
 Usage:
@@ -22,13 +22,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 import syntropy
 
 
-OP_NAMES = ["NOP","MOV","ADD","SUB","MUL","DIV","JMP","JZ","JG","JL",
-            "SENSE","ACT","PUSH","POP","CALL","RET","HALT","RAND","ENERGY",
-            "MOD","CMP","AND","OR","XOR","NOT","IND","MIN","MAX","ABS","NEG","DUP","JNE",
-            "SWAP","GEN","PICK","DPTH","PC","SETPC","SQRT","EXP","TICK","DROP","OVER",
-            "SHL","SHR","BIT","MLOAD","MSTORE","GLOAD","GSTORE"]
-
-
 def _trial_worker(args):
     """Run one trial in an isolated subprocess. Returns entry dict."""
     energy, speed, regs, tick_rate, timeout = args
@@ -45,7 +38,7 @@ def _trial_worker(args):
     _syn.TICK_RATE = max(0.01, tick_rate)
     _syn.MAX_SYSTEM_ENERGY = max(10, energy)
     _syn.MAX_MOVEMENT_SPEED = max(0, speed)
-    _syn.NUM_REGS = max(1, min(64, regs))
+    _syn.NUM_REGS = max(1, min(32, regs))
     _syn.SEED = 42
     rnd.seed(42)
 
@@ -64,21 +57,15 @@ def _trial_worker(args):
             await world.mixer.stop()
 
         best_vm = ""
+        best_genome = []
         if world.organisms:
             best_org = max(world.organisms, key=lambda o: o.generation)
             if best_org.generation > 0:
-                g = best_org.genome
-                decoded = []
-                for i in range(0, min(len(g), 54), 3):
-                    if i + 2 >= len(g):
-                        break
-                    op = g[i] % _syn.Op.TOTAL
-                    a1 = g[i + 1] % 256
-                    a2 = g[i + 2] % 256
-                    decoded.append(f"{OP_NAMES[op]}({a1},{a2})")
-                prog = " ".join(decoded[:18])
+                g = [int(w) & 0xFFFFFFFF for w in best_org.genome]
+                best_genome = g
+                prog = " ; ".join(_syn.disasm_rv32(w) for w in g[:18])
                 best_vm = f"gen={best_org.generation} age={best_org.age:.0f} " \
-                          f"len={len(best_org.genome)} vm=[{prog}]"
+                          f"len={len(g)} vm=[{prog}]"
 
         return {
             "ticks": world.tick,
@@ -90,6 +77,7 @@ def _trial_worker(args):
             "fossils": world.fossil_count,
             "timed_out": timed_out,
             "best_vm": best_vm,
+            "best_genome": best_genome,
             "wall_time": round(time.time() - t0, 2),
         }
 
@@ -132,7 +120,7 @@ def main():
 
     energy_vals = [100, 200, 400, 800, 1600]
     speed_vals = [0, 20, 30, 40, 50]
-    reg_vals = [2, 4, 8, 16]
+    reg_vals = [4, 8, 16, 32]
 
     if args.method == "grid":
         combos = list(itertools.product(energy_vals, speed_vals, reg_vals))
