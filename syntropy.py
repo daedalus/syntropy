@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""evo - VM-genome evolutionary ecosystem.
+"""syntropy - VM-genome evolutionary ecosystem.
 
-Each organism carries a Turing-complete VM as its genome.
+Each organism carries a RISC-V RV32I VM program as its genome.
 Energy = gas. Traits emerge from VM programs, not hardcoded genes.
-Async organisms, per-organism audio channels, day/night toroidal world.
+Async organisms, per-organism audio channels, day/night bounded (non-toroidal) world.
 """
 
 import asyncio
@@ -26,6 +26,7 @@ SOUND_VOLUME = 0.3
 SHARED_MEM_ENABLED = False   # experimental: shared memory + symbolic signals (opt-in)
 SHARED_MEM_SIZE = 64
 FIGHT_OVERLAP_ENABLED = False
+REGISTER_SCAN_ACTIONS = True  # also derive actions from non-zero register values (bootstrap aid)
 
 WIDTH = 72
 HEIGHT = 26
@@ -474,8 +475,23 @@ ACTION_BASE = 0x500
 ACTION_CNT_ADDR = 0x540
 BUDGET_ADDR = 0x544
 TICK_ADDR = 0x548
-SHARED_MEM_BASE = 0x600
 SENSE_SCALE = 1000
+MEM_SIZE = 4096
+
+
+def _to_fixed(val, scale: int = SENSE_SCALE) -> int:
+    """Scale a float to a signed 32-bit fixed-point int. NaN -> 0, +/-inf saturate."""
+    try:
+        v = float(val) * scale
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if v != v:
+        return 0
+    if v >= 2**31 - 1:
+        return 2**31 - 1
+    if v <= -2**31:
+        return -2**31
+    return int(v)
 
 class Sensor:
     FOOD_X, FOOD_Y, FOOD_DIST = 0, 1, 2
@@ -537,14 +553,17 @@ _name_cache: Dict[Tuple[int, ...], str] = {}
 class RVVMBot:
     """RISC-V RV32I VM used as the organism's genome/brains.
 
-    Memory map:
-        0x0000-0x03FF: General RAM (local mem slots 0-15 at 0x0000+slot*4)
-        0x0400-0x04FF: Sensor inputs (64 sensors x4 bytes, read-only to host)
+    Memory map (per execution, MEM_SIZE bytes):
+        0x0000-0x03FF: Local memory; slots 0..VM_MEM_SIZE-1 at slot*4. Persisted
+                       on the bot between ticks (``local_mem``) and inherited
+                       (with noise) by offspring.
+        0x0400-0x04FF: Sensor inputs (x4 bytes each, read-only to host)
         0x0500-0x053F: Action output buffer (16 x4 bytes)
-        0x0540:       Action count (byte)
         0x0544:       Remaining budget (scaled int)
         0x0548:       Current tick
-        0x0600-0x06FF: Shared memory (64 x4 bytes, if enabled)
+    Shared world memory (if enabled) is reached only through GLOAD/GSTORE ECALLs.
+
+    Registers beyond NUM_REGS alias modulo NUM_REGS (NUM_REGS=32 is plain RV32I).
     """
 
     def __init__(self, genome):
@@ -553,7 +572,8 @@ class RVVMBot:
         self.pc = 0
         self.running = True
         self.instr_count = 0
-        self.mem = bytearray(4096)
+        self.mem = bytearray(MEM_SIZE)
+        self.local_mem = bytearray(VM_MEM_SIZE * 4)
         self._senses = {}
         self._budget = 0.0
         self._shared_mem = None
@@ -575,26 +595,27 @@ class RVVMBot:
         return RVVMBot(self.genome[:pt] + other.genome[pt:])
 
     def execute(self, budget: float, senses: Dict[int, float], tick: int = 0,
-                shared_mem: Optional[bytearray] = None) -> List[Tuple[int, int]]:
+                shared_mem: Optional[bytearray] = None) -> List[Tuple[int, int, float]]:
+        if not math.isfinite(budget):
+            budget = 0.0
         self.r = [0] * 32
         self.pc = 0
         self.running = True
         self.instr_count = 0
-        self.mem = bytearray(4096)
+        self.mem = bytearray(MEM_SIZE)
+        n_local = min(len(self.local_mem), SENSE_BASE)
+        self.mem[:n_local] = self.local_mem[:n_local]
         self._senses = senses
         self._budget = budget
         self._shared_mem = shared_mem
-        self._action_words: List[Tuple[int, int]] = []
 
         for sid, val in senses.items():
             addr = SENSE_BASE + sid * 4
-            if addr + 4 <= len(self.mem):
-                ival = int(val * SENSE_SCALE)
-                ival = max(-2**31, min(2**31 - 1, ival))
-                self.mem[addr:addr+4] = ival.to_bytes(4, 'little', signed=True)
+            if 0 <= addr and addr + 4 <= len(self.mem):
+                self.mem[addr:addr+4] = _to_fixed(val).to_bytes(4, 'little', signed=True)
 
-        self.mem[TICK_ADDR:TICK_ADDR+4] = tick.to_bytes(4, 'little', signed=True)
-        budget_int = max(0, min(2**31-1, int(budget * 100)))
+        self.mem[TICK_ADDR:TICK_ADDR+4] = s32(tick).to_bytes(4, 'little', signed=True)
+        budget_int = max(0, min(2**31 - 1, int(budget * 100)))
         self.mem[BUDGET_ADDR:BUDGET_ADDR+4] = budget_int.to_bytes(4, 'little', signed=True)
 
         max_instr = max(10, min(200, int(budget * 50)))
@@ -603,21 +624,25 @@ class RVVMBot:
                 break
             self._step()
 
+        # Persist local memory for the next tick / offspring.
+        self.local_mem[:n_local] = self.mem[:n_local]
+
         actions = []
         used = set()
-        for rv in self.r:
-            if rv == 0:
-                continue
-            act_id = rv & 0xF
-            if act_id >= Action.TOTAL:
-                continue
-            key = (act_id, (rv >> 4) & 0xF)
-            if key in used:
-                continue
-            used.add(key)
-            actions.append((act_id, (rv >> 4) & 0xF, 0.0))
-            if len(actions) >= 8:
-                break
+        if REGISTER_SCAN_ACTIONS:
+            for rv in self.r[:NUM_REGS]:
+                if rv == 0:
+                    continue
+                act_id = rv & 0xF
+                if act_id >= Action.TOTAL:
+                    continue
+                key = (act_id, (rv >> 4) & 0xF)
+                if key in used:
+                    continue
+                used.add(key)
+                actions.append((act_id, (rv >> 4) & 0xF, 0.0))
+                if len(actions) >= 8:
+                    break
 
         for i in range(16):
             word = struct.unpack_from('<i', self.mem, ACTION_BASE + i * 4)[0]
@@ -643,12 +668,13 @@ class RVVMBot:
         idx = self.pc // 4
         inst = u32(self.genome[idx])
         pc_next = u32(self.pc + 4)
+        nregs = NUM_REGS
 
         opcode = inst & 0x7F
-        rd = (inst >> 7) & 0x1F
+        rd = ((inst >> 7) & 0x1F) % nregs
         f3 = (inst >> 12) & 0x7
-        rs1 = (inst >> 15) & 0x1F
-        rs2 = (inst >> 20) & 0x1F
+        rs1 = ((inst >> 15) & 0x1F) % nregs
+        rs2 = ((inst >> 20) & 0x1F) % nregs
         f7 = (inst >> 25) & 0x7F
         vrs1 = u32(self.r[rs1])
         vrs2 = u32(self.r[rs2])
@@ -663,7 +689,7 @@ class RVVMBot:
         elif opcode == 0x67:     # JALR
             if rd:
                 self.r[rd] = u32(pc_next)
-            pc_next = (vrs1 + i_imm(inst)) & ~1
+            pc_next = u32((vrs1 + i_imm(inst)) & ~1)
         elif opcode == 0x63:     # BRANCH
             taken = {0: vrs1 == vrs2, 1: vrs1 != vrs2, 4: s32(vrs1) < s32(vrs2),
                      5: s32(vrs1) >= s32(vrs2),
@@ -672,12 +698,13 @@ class RVVMBot:
                 pc_next = u32(self.pc + b_extract(inst))
         elif opcode == 0x03:     # LOAD
             addr = u32(vrs1 + i_imm(inst))
+            size = {1: 2, 2: 4, 5: 2}.get(f3, 1)
             val = 0
-            if addr + 4 <= len(self.mem):
+            if addr + size <= len(self.mem):
                 if f3 == 2:    # LW
                     val = struct.unpack_from('<i', self.mem, addr)[0]
                 elif f3 == 1:  # LH
-                    val = sext(struct.unpack_from('<h', self.mem, addr)[0], 16)
+                    val = struct.unpack_from('<h', self.mem, addr)[0]
                 elif f3 == 5:  # LHU
                     val = struct.unpack_from('<H', self.mem, addr)[0]
                 elif f3 == 4:  # LBU
@@ -688,19 +715,15 @@ class RVVMBot:
                 self.r[rd] = u32(val)
         elif opcode == 0x23:     # STORE
             addr = u32(vrs1 + s_imm(inst))
-            if addr + 4 <= len(self.mem):
+            size = {0: 1, 1: 2, 2: 4}.get(f3)
+            if size is not None and addr + size <= len(self.mem):
                 v = u32(self.r[rs2])
                 if f3 == 2:    # SW
                     struct.pack_into('<i', self.mem, addr, s32(v))
-                    act_id = v & 0xF
-                    if act_id < Action.TOTAL and len(self._action_words) < 16:
-                        arg = (v >> 4) & 0xF
-                        self._action_words.append((act_id, arg, 0.0))
                 elif f3 == 0:  # SB
                     self.mem[addr] = v & 0xFF
-                elif f3 == 1:  # SH
-                    v16 = v & 0xFFFF
-                    struct.pack_into('<h', self.mem, addr, v16 if v16 < 0x8000 else v16 - 0x10000)
+                else:          # SH
+                    struct.pack_into('<H', self.mem, addr, v & 0xFFFF)
         elif opcode == 0x13:     # OP-IMM
             imm = i_imm(inst)
             if rd:
@@ -751,18 +774,20 @@ class RVVMBot:
         self.pc = pc_next
 
     def _ecall(self):
-        a7 = self.r[17] & 0xFF
-        a0 = u32(self.r[10])
-        a1 = u32(self.r[11])
+        # a0/a1/a7 (x10/x11/x17), aliased modulo NUM_REGS (never onto hardwired x0).
+        ia0, ia1, ia7 = (10 % NUM_REGS) or 1, (11 % NUM_REGS) or 1, (17 % NUM_REGS) or 1
+        a7 = self.r[ia7] & 0xFF
+        a0 = u32(self.r[ia0])
+        a1 = u32(self.r[ia1])
 
         if a7 == 0:  # SENSE
             sid = a0 % NUM_SENSORS
-            val = self._senses.get(sid, 0.0)
-            self.r[10] = int(val * SENSE_SCALE)
+            self.r[ia0] = u32(_to_fixed(self._senses.get(sid, 0.0)))
         elif a7 == 1:  # ACT
             act_id = a0 % Action.TOTAL
-            arg = int(a1) & 0xFF
-            word = (act_id & 0xFF) | ((arg & 0xFF) << 8)
+            arg = a1 & 0xFF
+            # Bit 16 marks the slot as used so ACT(MOVE, 0) (word 0) is not lost.
+            word = (act_id & 0xFF) | (arg << 8) | (1 << 16)
             for i in range(16):
                 addr = ACTION_BASE + i * 4
                 existing = struct.unpack_from('<i', self.mem, addr)[0]
@@ -771,34 +796,29 @@ class RVVMBot:
                     break
         elif a7 == 2:  # ENERGY
             remaining = max(0, self._budget - self.instr_count * 0.01)
-            self.r[10] = int(remaining * 1000)
+            self.r[ia0] = u32(int(remaining * 1000))
         elif a7 == 3:  # HALT
             self.running = False
         elif a7 == 4:  # RAND
-            self.r[10] = random.randint(0, 10000)
+            self.r[ia0] = random.randint(0, 10000)
         elif a7 == 5:  # TICK
-            val = struct.unpack_from('<i', self.mem, TICK_ADDR)[0]
-            self.r[10] = val
+            self.r[ia0] = u32(struct.unpack_from('<i', self.mem, TICK_ADDR)[0])
         elif a7 == 6:  # MLOAD
             slot = a0 % VM_MEM_SIZE
-            addr = slot * 4
-            val = struct.unpack_from('<i', self.mem, addr)[0]
-            self.r[10] = val
+            self.r[ia0] = u32(struct.unpack_from('<i', self.mem, slot * 4)[0])
         elif a7 == 7:  # MSTORE
             slot = a0 % VM_MEM_SIZE
-            addr = slot * 4
-            struct.pack_into('<i', self.mem, addr, a1)
+            struct.pack_into('<i', self.mem, slot * 4, s32(a1))
         elif a7 == 8:  # GLOAD
             if self._shared_mem is not None:
                 slot = a0 % len(self._shared_mem)
-                self.r[10] = self._shared_mem[slot]
+                self.r[ia0] = self._shared_mem[slot]
         elif a7 == 9:  # GSTORE
             if self._shared_mem is not None:
                 slot = a0 % len(self._shared_mem)
-                self._shared_mem[slot] = max(0, min(255, a1))
+                self._shared_mem[slot] = max(0, min(255, s32(a1)))
 
 
-# Audio mixer — per-organism stereo audio in background thread
 class AudioMixer:
     SR = 22050
 
@@ -997,7 +1017,9 @@ class Organism:
         return self.genome_a
 
 
-def _tdist(a: int, b: int, size: int) -> int:
+def _tdist(a: int, b: int, size: int = 0) -> int:
+    """1-D distance. The world is bounded (edges clamp), so ``size`` is unused
+    and kept only for call-site compatibility."""
     return abs(a - b)
 
 
@@ -1086,6 +1108,12 @@ class World:
             "old_age": 0, "disease": 0, "unknown": 0,
         }
         self.seed_used = SEED
+        self.vm_faults = 0
+        self._dead_this_tick: Set[int] = set()
+        self._sense_idx_valid = False
+        self._res_order: Dict[Tuple[int, int], int] = {}
+        self._org_order: Dict[int, int] = {}
+        self._org_grid: Dict[Tuple[int, int], List[Organism]] = {}
 
         for _ in range(INITIAL_RESOURCES):
             rtype = random.choices(RESOURCE_KEYS, weights=[t["weight"] for t in RESOURCE_TYPES.values()])[0]
@@ -1178,7 +1206,7 @@ class World:
         self, x: int, y: int, genome: list, energy: float = 3.0, generation: int = 0,
         genome_b: Optional[List[int]] = None, active_bank: int = 0,
         parent_id: int = -1,
-        parent_mem: Optional[List[float]] = None,
+        parent_mem: Optional[bytearray] = None,
     ) -> Organism:
         ga = list(genome)
         gb = list(genome_b) if genome_b is not None else list(genome)
@@ -1203,10 +1231,11 @@ class World:
         )
         org.vm.genome = ga
         if parent_mem is not None:
-            size = min(len(parent_mem), VM_MEM_SIZE * 4)
-            for i in range(size):
-                v = parent_mem[i] + random.randint(-2, 2)
-                org.vm.mem[i] = max(0, min(255, v))
+            # Cultural transmission: copy the parent's persistent int32 slots with small noise.
+            size = min(len(parent_mem), len(vm.local_mem)) // 4 * 4
+            for i in range(0, size, 4):
+                v = struct.unpack_from('<i', parent_mem, i)[0] + int(round(random.gauss(0, 2)))
+                struct.pack_into('<i', vm.local_mem, i, max(-2**31, min(2**31 - 1, v)))
         self.organisms.append(org)
         self.all_genomes_seen.add(tuple(ga))
         return org
@@ -1230,15 +1259,77 @@ class World:
             night_dist = dist_to_term - WIDTH / 2
             return 0.5 - 0.5 * math.cos(2 * math.pi * night_dist / WIDTH)
 
+    # ── nearest-neighbour queries (exact, same tie-breaking as a linear scan) ──
+    _LINEAR_SCAN_MAX = 64
+
+    def _build_sense_index(self):
+        """Index organisms/resources once per tick so sensing is not O(N*(R+N))."""
+        self._res_order = {pos: i for i, pos in enumerate(self.resources)}
+        self._org_order = {}
+        self._org_grid = {}
+        for i, o in enumerate(self.organisms):
+            self._org_order[o.id] = i
+            self._org_grid.setdefault((o.x, o.y), []).append(o)
+        self._sense_idx_valid = True
+
+    def _nearest_resource(self, x: int, y: int):
+        """Nearest resource by Manhattan distance; ties go to dict order."""
+        n = len(self.resources)
+        best, bd = None, 999
+        if n == 0:
+            return best, bd
+        if n <= self._LINEAR_SCAN_MAX or not self._sense_idx_valid:
+            for (fx, fy) in self.resources:
+                d = abs(x - fx) + abs(y - fy)
+                if d < bd:
+                    bd, best = d, (fx, fy)
+            return best, bd
+        bo = 0
+        r = 0
+        maxr = WIDTH + HEIGHT
+        while r <= maxr and r <= bd:
+            for dx in range(-r, r + 1):
+                rem = r - abs(dx)
+                for dy in ((rem, -rem) if rem else (0,)):
+                    pos = (x + dx, y + dy)
+                    if pos in self._res_order:
+                        order = self._res_order[pos]
+                        if r < bd or order < bo:
+                            bd, best, bo = r, pos, order
+            r += 1
+        return best, bd
+
+    def _nearest_organism(self, org: Organism):
+        """Nearest other living organism by Manhattan distance; ties go to list order."""
+        best, bd = None, 999
+        n = len(self.organisms)
+        if n <= self._LINEAR_SCAN_MAX or not self._sense_idx_valid:
+            for other in self.organisms:
+                if other is org or other.id in self._dead_this_tick:
+                    continue
+                d = abs(org.x - other.x) + abs(org.y - other.y)
+                if d < bd:
+                    bd, best = d, other
+            return best, bd
+        bo = 0
+        r = 0
+        maxr = WIDTH + HEIGHT
+        while r <= maxr and r <= bd:
+            for dx in range(-r, r + 1):
+                rem = r - abs(dx)
+                for dy in ((rem, -rem) if rem else (0,)):
+                    for other in self._org_grid.get((org.x + dx, org.y + dy), ()):
+                        if other is org or other.id in self._dead_this_tick:
+                            continue
+                        order = self._org_order[other.id]
+                        if r < bd or order < bo:
+                            bd, best, bo = r, other, order
+            r += 1
+        return best, bd
+
     def compute_senses(self, org: Organism) -> Dict[int, float]:
         senses = {}
-        best_food = None
-        best_fd = 999
-        for (fx, fy) in self.resources:
-            d = _tdist(org.x, fx, WIDTH) + _tdist(org.y, fy, HEIGHT)
-            if d < best_fd:
-                best_fd = d
-                best_food = (fx, fy)
+        best_food, best_fd = self._nearest_resource(org.x, org.y)
         if best_food:
             senses[Sensor.FOOD_X] = float(best_food[0])
             senses[Sensor.FOOD_Y] = float(best_food[1])
@@ -1248,15 +1339,7 @@ class World:
             senses[Sensor.FOOD_DIST] = 99.0
             senses[Sensor.FOOD_DIR] = 0.0
 
-        best_org = None
-        best_od = 999
-        for other in self.organisms:
-            if other is org or other.id in self._dead_this_tick:
-                continue
-            d = _tdist(org.x, other.x, WIDTH) + _tdist(org.y, other.y, HEIGHT)
-            if d < best_od:
-                best_od = d
-                best_org = other
+        best_org, best_od = self._nearest_organism(org)
         if best_org:
             senses[Sensor.ORG_X] = float(best_org.x)
             senses[Sensor.ORG_Y] = float(best_org.y)
@@ -1412,7 +1495,7 @@ class World:
                                     active_bank=random.randint(0, 1),
                                     energy=2.5, generation=child_g,
                                     parent_id=org.id,
-                                    parent_mem=org.vm.mem)
+                                    parent_mem=org.vm.local_mem)
                 self._log_action(f"O{org.id} ♥ O{child.id}")
             else:
                 cost = ENERGY_COST_PER_CHILD * 0.6
@@ -1424,7 +1507,7 @@ class World:
                                     active_bank=random.randint(0, 1),
                                     energy=2.0, generation=child_g,
                                     parent_id=org.id,
-                                    parent_mem=org.vm.mem)
+                                    parent_mem=org.vm.local_mem)
                 if child_g > self.max_gen_ever:
                     self.max_gen_ever = child_g
                     self.events.append(f"Gen {child_g} reached!")
@@ -1552,12 +1635,22 @@ class World:
             org.vm.genome = org.genome_a if org.active_bank == 0 else org.genome_b
             senses = self.compute_senses(org)
             budget = min(org.energy * 0.4, 8.0)
-            actions = org.vm.execute(budget, senses, tick=self.tick, shared_mem=self.shared_mem)
+            try:
+                actions = org.vm.execute(budget, senses, tick=self.tick, shared_mem=self.shared_mem)
+            except Exception as exc:  # a faulty genome must never take the world down
+                actions = []
+                self.vm_faults += 1
+                self._log_action(f"O{org.id} VM fault: {type(exc).__name__}")
+            finally:
+                org.vm.genome = org.genome_a
             org.last_regs = org.vm.r.copy()
-            org.vm.genome = org.genome_a
             return (org, actions, senses)
 
-        results = await asyncio.gather(*[_run_org(o) for o in self.organisms])
+        self._build_sense_index()
+        try:
+            results = await asyncio.gather(*[_run_org(o) for o in self.organisms])
+        finally:
+            self._sense_idx_valid = False
 
         # Apply actions and organism-level systems
         dead: Set[int] = set()
@@ -2147,7 +2240,7 @@ class World:
 
 
 async def main():
-    global SOUND_ENABLED, ENVIRONMENTAL_SOUNDS_ENABLED, SOUND_VOLUME, TICK_RATE, MUTATION_RATE, VM_MEM_SIZE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY, MAX_MOVEMENT_SPEED, MAX_AGE, SHARED_MEM_ENABLED, SHARED_MEM_SIZE, INITIAL_ORGANISMS, DAY_LENGTH
+    global SOUND_ENABLED, ENVIRONMENTAL_SOUNDS_ENABLED, SOUND_VOLUME, TICK_RATE, MUTATION_RATE, VM_MEM_SIZE, EXTINCTION_LOG_FILE, SEED, WIDTH, HEIGHT, MAX_SYSTEM_ENERGY, MAX_MOVEMENT_SPEED, MAX_AGE, SHARED_MEM_ENABLED, SHARED_MEM_SIZE, INITIAL_ORGANISMS, DAY_LENGTH, NUM_REGS, REGISTER_SCAN_ACTIONS
     parser = argparse.ArgumentParser(description="VM-genome evolutionary ecosystem")
     parser.add_argument("--volume", type=float, default=SOUND_VOLUME)
     parser.add_argument("--no-sound", action="store_true")
@@ -2175,7 +2268,15 @@ async def main():
                     help="per-byte mutation rate during reproduction (default: %(default)s)")
     parser.add_argument("--vm-memory", type=int, default=VM_MEM_SIZE,
                     help="per-organism VM local memory slots (default: %(default)s)")
+    parser.add_argument("--n-registers", type=int, default=NUM_REGS,
+                    help="number of usable VM registers, 1-32 (default: %(default)s)")
+    parser.add_argument("--no-register-scan", action="store_true",
+                    help="derive actions only from explicit ACT ECALLs / action-buffer stores, "
+                         "not from register contents")
     args = parser.parse_args()
+    NUM_REGS = max(1, min(32, args.n_registers))
+    if args.no_register_scan:
+        REGISTER_SCAN_ACTIONS = False
     if args.no_sound:
         SOUND_ENABLED = False
     if args.no_environmental_sounds:
@@ -2243,6 +2344,8 @@ async def main():
         total_d = sum(ds.values()) or 1
         causes = "  ".join(f"{k}:{v} ({v*100//total_d}%)" for k, v in ds.items())
         print(f"  Deaths: {causes}")
+        if world.vm_faults:
+            print(f"  VM faults (organism programs that raised): {world.vm_faults}")
         print(f"  Species now: {len({tuple(o.genome) for o in world.organisms})}  "
               f"Infected: {len(world.diseased)}  "
               f"Fossil lineages: {world.fossil_count}")
